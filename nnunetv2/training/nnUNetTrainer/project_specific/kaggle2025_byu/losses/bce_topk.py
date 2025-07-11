@@ -21,7 +21,7 @@ class BCE_topK_loss(nn.Module):
         n = max(1, round(np.prod(loss.shape[-3:]) * sample_scalar(self.k) / 100))
         loss = loss.view((*loss.shape[:2], -1))
         loss = topk(loss, k=n, sorted=False)[0]
-        loss = loss.mean(-1).mean()
+        loss = loss.mean()
         return loss
 
 
