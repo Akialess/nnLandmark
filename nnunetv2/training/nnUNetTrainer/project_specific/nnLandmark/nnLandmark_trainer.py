@@ -181,6 +181,7 @@ class nnLandmark_trainer(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT2
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.min_motor_distance = 15
         self.enable_deep_supervision = False
+        self.num_epochs = 1000
 
     def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
         """
