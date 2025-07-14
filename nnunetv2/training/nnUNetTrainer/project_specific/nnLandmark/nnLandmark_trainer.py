@@ -1,3 +1,4 @@
+import SimpleITK as sitk
 import multiprocessing
 from copy import deepcopy
 from time import sleep
@@ -7,13 +8,16 @@ import cc3d
 import edt
 import numpy as np
 import torch
-from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
+from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd, insert_crop_into_image
 from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
-from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p, save_json
+from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p, save_json, subfiles
 from batchgeneratorsv2.helpers.scalar_type import RandomScalar, sample_scalar
 from batchgeneratorsv2.transforms.base.basic_transform import BasicTransform
 from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
+from nnunetv2.dataset_conversion.Dataset119_ToothFairy2_All import load_json
+from nnunetv2.dataset_conversion.Dataset737_convert_to_spheres import generate_segmentation
+from nnunetv2.paths import nnUNet_raw
 from threadpoolctl import threadpool_limits
 from torch import nn, autocast, topk
 from torch.nn import functional as F, BCEWithLogitsLoss
@@ -31,7 +35,52 @@ from nnunetv2.training.nnUNetTrainer.project_specific.kaggle2025_byu.fp_oversamp
     MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT25
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
-from nnunetv2.utilities.helpers import dummy_context
+from nnunetv2.utilities.helpers import dummy_context, empty_cache
+from torch.nn.functional import interpolate
+
+
+def evaluate_MSE(folder_with_pred_jsons: str, gt_json: str):
+    """
+    IMPORTANT this function only computes the MSE for all landmarks in the GT.
+    It DOES NOT evaluate landmark detection, so whether landmarks are predicted that are not in the GT! I will just
+    take the coordinate of each landmark, irrespective of its predicted likelihood.
+    So this function can only be used for datasets where all landmarks are present in all images!
+
+    If this is not the case, a more sophisticated evaluation scheme is needed where we evaluate MSE and a landmark detection metric
+
+    TODO this script currently only considers pixel distances and does not take into account the voxel spacing!
+    """
+    # folder_with_pred_jsons = '/home/isensee/drives/checkpoints/nnUNet_results/Dataset737_FPOSE/nnLandmark_trainer__nnUNetResEncUNetLPlans__3d_fullres/crossval_predictions'
+    # gt_json = '/home/isensee/drives/E132-Rohdaten/nnUNetv2/Dataset737_FPOSE/landmark_coordinates.json'
+    predicted_jsons = [i for i in subfiles(folder_with_pred_jsons, suffix='.json', join=False) if i != 'summary.json']
+    # we always predict something for all landmarks, so we can infer how many landmarks there are from any model output json
+    all_landmarks = [int(i) for i in load_json(join(folder_with_pred_jsons, predicted_jsons[0])).keys()]
+    gt = load_json(gt_json)
+    predicted_identifiers = [i[:-5] for i in predicted_jsons]
+    not_in_gt = [i for i in predicted_identifiers if i not in gt.keys()]
+    not_in_pred = [i for i in gt.keys() if i not in predicted_identifiers]
+    assert len(not_in_gt) == 0, f'There are identifiers in the prediction that are not in the GT. Cannot run script.\nNot in gt: {not_in_gt}'
+    if len(not_in_pred) != 0:
+        print(f'WARNING! Not all identifiers from the ground truth are found in the prediction. This can be intentional or not. GT: {len(gt.keys())}, pred: {len(predicted_identifiers)} identifiers')
+    errors = {i: list() for i in all_landmarks}
+    detailed_results = {}
+    for k in gt.keys():
+        if k in not_in_pred:
+            continue
+        gt_here = gt[k]
+        pred_here = load_json(join(folder_with_pred_jsons, k + '.json'))
+        detailed_results[k] = {}
+        for ki in gt_here.keys():
+            pred_coords = pred_here[ki]['coordinates']
+            gt_coords = gt_here[ki]
+            dist = np.linalg.norm([i - j for i, j in zip(pred_coords, gt_coords)])
+            # if dist > 30:
+            #     import IPython;IPython.embed()
+            detailed_results[k][ki] = float(np.round(dist, decimals=5))
+            errors[int(ki)].append(dist)
+    mse_by_landmark = {k: np.mean(np.array(errors[k]) ** 2) for k in errors.keys()}
+    mse = np.mean(list(mse_by_landmark.values()))
+    save_json({'MSE': mse, 'MSE_by_landmark': {i: float(np.round(mse_by_landmark[i], decimals=5)) for i in mse_by_landmark.keys()}, 'detailed_results': detailed_results}, join(folder_with_pred_jsons, 'summary.json'), sort_keys=False)
 
 
 class nnLandmarkLoader(nnUNetDataLoader):
@@ -300,6 +349,7 @@ class nnLandmark_trainer(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT2
 
         dsj = deepcopy(self.dataset_json)
         dsj['labels'] = {'background': 0, **{str(i): i for i in range(1, 22)}}
+        # don't worry about use_mirroring=True. self.inference_allowed_mirroring_axes is None.
         predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                     perform_everything_on_device=True, device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
@@ -348,18 +398,22 @@ class nnLandmark_trainer(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT2
                 output_filename_truncated = join(validation_output_folder, k)
 
                 # predict logits
-                prediction = predictor.predict_sliding_window_return_logits(data)
-                prediction = F.sigmoid(prediction).float()
+                with torch.no_grad():
+                    prediction = predictor.predict_sliding_window_return_logits(data)
+                    empty_cache(self.device)
+                    prediction = F.sigmoid(prediction).float()
 
-                # detect landmarks as maximum predicted value in each channel
-                mx = prediction.max(-1)[0].max(-1)[0].max(-1)[0]
-                detected_coords = [torch.argwhere(prediction[c] == mx[c])[0] for c in range(len(mx))]
+                    # detect landmarks as maximum predicted value in each channel
+                    mx = prediction.max(-1)[0].max(-1)[0].max(-1)[0]
+                    detected_coords = [torch.argwhere(prediction[c] == mx[c])[0] for c in range(len(mx))]
+                    empty_cache(self.device)
 
                 det_p = [prediction[j][*i].item() for j, i in enumerate(detected_coords)]
                 detected_coords = [[i.item() for i in j] for j in detected_coords]
 
                 # convert coords to original geometry
-
+                # revert transpose
+                detected_coords = [[i[j] for j in self.plans_manager.transpose_backward] for i in detected_coords]
                 # revert resize
                 new_coordinates = convert_coordinates(detected_coords, data.shape[-3:], properties['shape_after_cropping_and_before_resampling'])
                 # revert cropping
@@ -367,7 +421,40 @@ class nnLandmark_trainer(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT2
                 new_coordinates = [[k + crop_offset[l] for l, k in enumerate(i)] for i in new_coordinates]
 
                 # export coordinates
-                save_json({i: {'coordinates': j, 'likelihood': l} for i, j, l in zip(range(1, 23), new_coordinates, det_p)}, join(validation_output_folder, k + '.json'))
+                out_dict = {i: {'coordinates': j, 'likelihood': l} for i, j, l in zip(range(1, 23), new_coordinates, det_p)}
+                save_json(out_dict, join(validation_output_folder, k + '.json'))
+
+                # generate a segmentation visualizing the predicted coords
+                seg = generate_segmentation(properties['shape_before_cropping'], {i: out_dict[i]['coordinates'] for i in out_dict.keys()}, radius=4)
+                self.plans_manager.image_reader_writer_class().write_seg(seg, join(validation_output_folder, k + self.dataset_json['file_ending']), properties)
+
+                # export heatmaps, only works for nifti
+                if 'sitk_stuff' in properties.keys():
+                    # revert resize
+                    prediction_resized = interpolate(prediction[None], properties['shape_after_cropping_and_before_resampling'], mode='trilinear').cpu()[0]
+                    empty_cache(self.device)
+
+                    # revert cropping
+                    prediction_uncropped = torch.zeros((prediction_resized.shape[0], *properties['shape_before_cropping']), device='cpu', dtype=torch.float)
+                    insert_crop_into_image(prediction_uncropped, prediction_resized, properties['bbox_used_for_cropping'])
+                    del prediction_resized
+
+                    # revert transpose
+                    prediction_uncropped = prediction_uncropped.numpy().transpose([0] + [i + 1 for i in self.plans_manager.transpose_backward])
+
+                    # round to 0.01
+                    prediction_uncropped = np.round(prediction_uncropped, decimals=2)
+
+                    # convert to nifti and export
+                    for i in range(1, prediction_uncropped.shape[0] + 1):
+                        prediction_uncropped_itk = sitk.GetImageFromArray(prediction_uncropped[i-1])
+                        prediction_uncropped_itk.SetSpacing(properties['sitk_stuff']['spacing'])
+                        prediction_uncropped_itk.SetOrigin(properties['sitk_stuff']['origin'])
+                        prediction_uncropped_itk.SetDirection(properties['sitk_stuff']['direction'])
+
+                        sitk.WriteImage(prediction_uncropped_itk, join(validation_output_folder, k + f'__{i:03d}.nii.gz'))
+
+        evaluate_MSE(validation_output_folder, join(nnUNet_raw, self.plans_manager.dataset_name, 'landmark_coordinates.json'))
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
