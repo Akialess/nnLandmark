@@ -1,9 +1,9 @@
-import SimpleITK as sitk
 import multiprocessing
 from copy import deepcopy
 from time import sleep
 from typing import Union, Tuple, List
 
+import SimpleITK as sitk
 import cc3d
 import edt
 import numpy as np
@@ -12,19 +12,49 @@ from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd, inse
 from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p, save_json, subfiles
-from batchgeneratorsv2.helpers.scalar_type import RandomScalar, sample_scalar
+from batchgeneratorsv2.helpers.scalar_type import RandomScalar
+from batchgeneratorsv2.helpers.scalar_type import sample_scalar
 from batchgeneratorsv2.transforms.base.basic_transform import BasicTransform
+from batchgeneratorsv2.transforms.intensity.brightness import MultiplicativeBrightnessTransform, \
+    BrightnessAdditiveTransform
+from batchgeneratorsv2.transforms.intensity.contrast import ContrastTransform, BGContrast
+from batchgeneratorsv2.transforms.intensity.gamma import GammaTransform
+from batchgeneratorsv2.transforms.intensity.gaussian_noise import GaussianNoiseTransform
+from batchgeneratorsv2.transforms.intensity.inversion import InvertImageTransform
+from batchgeneratorsv2.transforms.intensity.random_clip import CutOffOutliersTransform
+from batchgeneratorsv2.transforms.local.brightness_gradient import BrightnessGradientAdditiveTransform
+from batchgeneratorsv2.transforms.local.local_gamma import LocalGammaTransform
+from batchgeneratorsv2.transforms.nnunet.random_binary_operator import ApplyRandomBinaryOperatorTransform
+from batchgeneratorsv2.transforms.nnunet.remove_connected_components import \
+    RemoveRandomConnectedComponentFromOneHotEncodingTransform
+from batchgeneratorsv2.transforms.nnunet.seg_to_onehot import MoveSegAsOneHotToDataTransform
+from batchgeneratorsv2.transforms.noise.gaussian_blur import GaussianBlurTransform
+from batchgeneratorsv2.transforms.noise.median_filter import MedianFilterTransform
+from batchgeneratorsv2.transforms.noise.sharpen import SharpeningTransform
+from batchgeneratorsv2.transforms.spatial.low_resolution import SimulateLowResolutionTransform
+from batchgeneratorsv2.transforms.spatial.mirroring import MirrorTransform
+from batchgeneratorsv2.transforms.spatial.rot90 import Rot90Transform
+from batchgeneratorsv2.transforms.spatial.spatial import SpatialTransform
+from batchgeneratorsv2.transforms.spatial.transpose import TransposeAxesTransform
 from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
-from nnunetv2.dataset_conversion.Dataset119_ToothFairy2_All import load_json
-from nnunetv2.dataset_conversion.Dataset737_convert_to_spheres import generate_segmentation
-from nnunetv2.paths import nnUNet_raw
+from batchgeneratorsv2.transforms.utils.nnunet_masking import MaskImageTransform
+from batchgeneratorsv2.transforms.utils.pseudo2d import Convert2DTo3DTransform
+from batchgeneratorsv2.transforms.utils.pseudo2d import Convert3DTo2DTransform
+from batchgeneratorsv2.transforms.utils.random import RandomTransform, OneOfTransform
+from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
+from batchgeneratorsv2.transforms.utils.seg_to_regions import ConvertSegmentationToRegionsTransform
 from threadpoolctl import threadpool_limits
 from torch import nn, autocast, topk
 from torch.nn import functional as F, BCEWithLogitsLoss
+from torch.nn.functional import interpolate
 
-from nnunetv2.configuration import default_num_processes, ANISO_THRESHOLD
+from nnunetv2.configuration import ANISO_THRESHOLD
+from nnunetv2.configuration import default_num_processes
+from nnunetv2.dataset_conversion.Dataset119_ToothFairy2_All import load_json
+from nnunetv2.dataset_conversion.Dataset737_convert_to_spheres import generate_segmentation
 from nnunetv2.dataset_conversion.kaggle_byu.official_data_to_nnunet import convert_coordinates
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.paths import nnUNet_raw
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
 from nnunetv2.training.data_augmentation.kaggle_byu_motor_regression import build_point, gaussian_kernel_3d, \
     paste_tensor_optionalMax
@@ -33,20 +63,21 @@ from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.nnUNetTrainer.project_specific.kaggle2025_byu.fp_oversampling.oversample_fp import \
     MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT25
+from nnunetv2.training.nnUNetTrainer.variants.data_augmentation.nnUNetTrainerDA5 import \
+    _brightnessadditive_localgamma_transform_scale, _brightness_gradient_additive_max_strength, _local_gamma_gamma
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
 from nnunetv2.utilities.helpers import dummy_context, empty_cache
-from torch.nn.functional import interpolate
 
 
-def evaluate_MSE(folder_with_pred_jsons: str, gt_json: str):
+def evaluate_MRE(folder_with_pred_jsons: str, gt_json: str):
     """
-    IMPORTANT this function only computes the MSE for all landmarks in the GT.
+    IMPORTANT this function only computes the MRE for all landmarks in the GT.
     It DOES NOT evaluate landmark detection, so whether landmarks are predicted that are not in the GT! I will just
     take the coordinate of each landmark, irrespective of its predicted likelihood.
     So this function can only be used for datasets where all landmarks are present in all images!
 
-    If this is not the case, a more sophisticated evaluation scheme is needed where we evaluate MSE and a landmark detection metric
+    If this is not the case, a more sophisticated evaluation scheme is needed where we evaluate MRE and a landmark detection metric
 
     TODO this script currently only considers pixel distances and does not take into account the voxel spacing!
     """
@@ -78,9 +109,13 @@ def evaluate_MSE(folder_with_pred_jsons: str, gt_json: str):
             #     import IPython;IPython.embed()
             detailed_results[k][ki] = float(np.round(dist, decimals=5))
             errors[int(ki)].append(dist)
-    mse_by_landmark = {k: np.mean(np.array(errors[k]) ** 2) for k in errors.keys()}
-    mse = np.mean(list(mse_by_landmark.values()))
-    save_json({'MSE': mse, 'MSE_by_landmark': {i: float(np.round(mse_by_landmark[i], decimals=5)) for i in mse_by_landmark.keys()}, 'detailed_results': detailed_results}, join(folder_with_pred_jsons, 'summary.json'), sort_keys=False)
+    mre_by_landmark = {k: np.mean(errors[k]) for k in errors.keys()}
+    mre = np.mean(list(mre_by_landmark.values()))
+    save_json({
+        'MRE': mre,
+        'MRE_by_landmark': {i: float(np.round(mre_by_landmark[i], decimals=5)) for i in mre_by_landmark.keys()},
+        'detailed_results': detailed_results
+    }, join(folder_with_pred_jsons, 'summary.json'), sort_keys=False)
 
 
 class nnLandmarkLoader(nnUNetDataLoader):
@@ -289,22 +324,239 @@ class nnLandmark_trainer(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT2
             regions: List[Union[List[int], Tuple[int, ...], int]] = None,
             ignore_label: int = None,
     ) -> BasicTransform:
-        ret: ComposeTransforms = super().get_training_transforms(
-            patch_size,
-            rotation_for_DA,
-            deep_supervision_scales,
-            mirror_axes,
-            do_dummy_2d_data_aug,
-            use_mask_for_norm,
-            is_cascaded,
-            foreground_labels,
-            regions,
-            ignore_label
+        """
+        Copied from the motor trainer. We need to disable axes transpose because if messes with left/right landmarks
+        """
+        matching_axes = np.array([sum([i == j for j in patch_size]) for i in patch_size])
+        valid_axes = list(np.where(matching_axes == np.max(matching_axes))[0])
+        transforms = []
+
+        transforms.append(RandomTransform(
+            CutOffOutliersTransform(
+                (0, 2.5),
+                (98.5, 100),
+                p_synchronize_channels=1,
+                p_per_channel=0.5,
+                p_retain_std=0.5
+            ), apply_probability=0.2
+        ))
+
+        if do_dummy_2d_data_aug:
+            ignore_axes = (0,)
+            transforms.append(Convert3DTo2DTransform())
+            patch_size_spatial = patch_size[1:]
+        else:
+            patch_size_spatial = patch_size
+            ignore_axes = None
+        transforms.append(
+            SpatialTransform(
+                patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
+                p_rotation=0.3, rotation=rotation_for_DA, p_scaling=0.3, scaling=(0.6, 1.67),
+                p_synchronize_scaling_across_axes=0.8,
+                bg_style_seg_sampling=False , mode_seg='nearest'
+            )
         )
-        ret.transforms[-2] = ConvertSegToLandmarkTarget(len(self.label_manager.foreground_labels), 'EDT',
-                                                        edt_radius=15)
-        del ret.transforms[-1]
-        return ret
+
+        if do_dummy_2d_data_aug:
+            transforms.append(Convert2DTo3DTransform())
+
+        if np.any(matching_axes > 1):
+            transforms.append(RandomTransform(
+                Rot90Transform(num_rot_per_combination=(1, 2, 3), num_axis_combinations=(1, 4), allowed_axes=set(valid_axes)),
+                apply_probability=0.5
+            ))
+            # transforms.append(RandomTransform(
+            #     TransposeAxesTransform(allowed_axes=set(valid_axes)),
+            #     apply_probability=0.5
+            # ))
+
+        OneOfTransform([
+            RandomTransform(
+                MedianFilterTransform(
+                (2, 8), p_same_for_each_channel=0.5, p_per_channel=0.5
+            ), apply_probability=0.2),
+            RandomTransform(
+                GaussianBlurTransform(
+                    blur_sigma=(0.3, 1.5),
+                    synchronize_channels=False,
+                    synchronize_axes=False,
+                    p_per_channel=0.5, benchmark=True
+            ), apply_probability=0.2
+        )
+        ])
+
+        transforms.append(RandomTransform(
+            GaussianNoiseTransform(
+                noise_variance=(0, 0.2),
+                p_per_channel=0.5,
+                synchronize_channels=True
+            ), apply_probability=0.3
+        ))
+
+        transforms.append(RandomTransform(
+                BrightnessAdditiveTransform(0, 0.5, per_channel=True, p_per_channel=0.5),
+                apply_probability=0.1
+            ))
+
+        transforms.append(OneOfTransform(
+            [
+                RandomTransform(
+                    ContrastTransform(
+                        contrast_range=BGContrast((0.75, 1.25)),
+                        preserve_range=True,
+                        synchronize_channels=False,
+                        p_per_channel=0.5
+                    ), apply_probability=0.3
+                ),
+                RandomTransform(
+                    MultiplicativeBrightnessTransform(
+                        multiplier_range=BGContrast((0.75, 1.25)),
+                        synchronize_channels=False,
+                        p_per_channel=0.5
+                    ), apply_probability=0.3
+                )
+            ]
+        ))
+
+        transforms.append(RandomTransform(
+            SimulateLowResolutionTransform(
+                scale=(0.5, 1),
+                synchronize_channels=False,
+                synchronize_axes=True,
+                ignore_axes=ignore_axes,
+                allowed_channels=None,
+                p_per_channel=0.5
+            ), apply_probability=0.15
+        ))
+
+        transforms.append(RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.6, 2)),
+                p_invert_image=1,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1
+            ), apply_probability=0.2
+        ))
+
+        transforms.append(RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.6, 2)),
+                p_invert_image=0,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1
+            ), apply_probability=0.2
+        ))
+
+        if mirror_axes is not None and len(mirror_axes) > 0:
+            transforms.append(
+                MirrorTransform(
+                    allowed_axes=mirror_axes
+                )
+            )
+
+        # transforms.append(RandomTransform(
+        #     BlankRectangleTransform(
+        #         [[max(1, p // 10), p // 3] for p in patch_size],
+        #         rectangle_value=torch.mean,
+        #         num_rectangles=(1, 5),
+        #         force_square=False,
+        #         p_per_channel=0.5
+        #     ),
+        #     apply_probability=0.2)
+        # )
+
+        transforms.append(RandomTransform(
+            BrightnessGradientAdditiveTransform(
+                _brightnessadditive_localgamma_transform_scale,
+                (-0.5, 1.5),
+                max_strength=_brightness_gradient_additive_max_strength,
+                same_for_all_channels=False,
+                mean_centered=True,
+                clip_intensities=False,
+                p_per_channel=0.5
+            ),
+            apply_probability=0.2))
+
+        transforms.append(RandomTransform(
+            LocalGammaTransform(
+                _brightnessadditive_localgamma_transform_scale,
+                (-0.5, 1.5),
+                _local_gamma_gamma,
+                same_for_all_channels=False,
+                p_per_channel=0.5
+            ), apply_probability=0.2
+        ))
+
+        transforms.append(RandomTransform(
+            SharpeningTransform(
+                (0.1, 1.5),
+                p_same_for_each_channel=0.5,
+                p_per_channel=0.5,
+                p_clamp_intensities=0.5
+            ), apply_probability=0.2
+        ))
+
+        transforms.append(RandomTransform(
+            InvertImageTransform(p_invert_image=1, p_synchronize_channels=0.5, p_per_channel=0.5), apply_probability=0.2
+        ))
+
+        if use_mask_for_norm is not None and any(use_mask_for_norm):
+            transforms.append(MaskImageTransform(
+                apply_to_channels=[i for i in range(len(use_mask_for_norm)) if use_mask_for_norm[i]],
+                channel_idx_in_seg=0,
+                set_outside_to=0,
+            ))
+
+        transforms.append(
+            RemoveLabelTansform(-1, 0)
+        )
+        if is_cascaded:
+            assert foreground_labels is not None, 'We need foreground_labels for cascade augmentations'
+            transforms.append(
+                MoveSegAsOneHotToDataTransform(
+                    source_channel_idx=1,
+                    all_labels=foreground_labels,
+                    remove_channel_from_source=True
+                )
+            )
+            transforms.append(
+                RandomTransform(
+                    ApplyRandomBinaryOperatorTransform(
+                        channel_idx=list(range(-len(foreground_labels), 0)),
+                        strel_size=(1, 8),
+                        p_per_label=1
+                    ), apply_probability=0.4
+                )
+            )
+            transforms.append(
+                RandomTransform(
+                    RemoveRandomConnectedComponentFromOneHotEncodingTransform(
+                        channel_idx=list(range(-len(foreground_labels), 0)),
+                        fill_with_other_class_p=0,
+                        dont_do_if_covers_more_than_x_percent=0.15,
+                        p_per_label=1
+                    ), apply_probability=0.2
+                )
+            )
+
+        if regions is not None:
+            # the ignore label must also be converted
+            transforms.append(
+                ConvertSegmentationToRegionsTransform(
+                    regions=list(regions) + [ignore_label] if ignore_label is not None else regions,
+                    channel_in_seg=0
+                )
+            )
+
+        transforms.append(ConvertSegToLandmarkTarget(len(self.label_manager.foreground_labels), 'EDT',
+                                                        edt_radius=15))
+
+        transforms = ComposeTransforms(transforms)
+
+        return transforms
+
 
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
@@ -454,7 +706,7 @@ class nnLandmark_trainer(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT2
 
                         sitk.WriteImage(prediction_uncropped_itk, join(validation_output_folder, k + f'__{i:03d}.nii.gz'))
 
-        evaluate_MSE(validation_output_folder, join(nnUNet_raw, self.plans_manager.dataset_name, 'landmark_coordinates.json'))
+        evaluate_MRE(validation_output_folder, join(nnUNet_raw, self.plans_manager.dataset_name, 'landmark_coordinates.json'))
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
