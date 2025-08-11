@@ -83,7 +83,7 @@ def evaluate_MRE(folder_with_pred_jsons: str, gt_json: str):
     TODO this script currently only considers pixel distances and does not take into account the voxel spacing!
     """
     # folder_with_pred_jsons = '/home/isensee/drives/checkpoints/nnUNet_results/Dataset737_FPOSE/nnLandmark_trainer__nnUNetResEncUNetLPlans__3d_fullres/crossval_predictions'
-    # gt_json = '/home/isensee/drives/E132-Rohdaten/nnUNetv2/Dataset737_FPOSE/landmark_coordinates.json'
+    # gt_json = '/home/isensee/drives/E132-Rohdaten/nnUNetv2/Dataset737_FPOSE/all_landmarks_voxel.json'
     predicted_jsons = [i for i in subfiles(folder_with_pred_jsons, suffix='.json', join=False) if i != 'summary.json']
     # we always predict something for all landmarks, so we can infer how many landmarks there are from any model output json
     name_label_dict = load_json(os.path.join(os.path.dirname(gt_json), 'name_to_label.json'))
@@ -176,42 +176,6 @@ class nnLandmarkLoader(nnUNetDataLoader):
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
 
-class BCE_topK_loss_landmark(nn.Module):
-    def __init__(self, k: RandomScalar = 100):
-        super().__init__()
-        self.bce = BCEWithLogitsLoss(reduction='none')
-        # for topk k must be int with k being the number of elements that are returned. We use k as a percentage here,
-        # so k=5 will mean top 5 % of pixels!
-        self.k = k
-        self.preallocated_dummy_target: torch.Tensor = None
-
-    def forward(self, net_output: torch.Tensor, target_structure: torch.Tensor, bboxes):
-        # net_output is b, c, x, y, z
-        # target_structure is a list of tensors x, y, z
-        # bboxes is a list of dicts mapping an index to a bbox
-        if self.preallocated_dummy_target is None:
-            self.preallocated_dummy_target = torch.zeros(net_output.shape, device=net_output.device,
-                                                         dtype=torch.float32)
-
-        with torch.no_grad():
-            self.preallocated_dummy_target.zero_()
-
-            for b in range(net_output.shape[0]):
-                for c in range(net_output.shape[1]):
-                    # insert into preallocated_dummy_target
-                    if c + 1 in bboxes[b].keys():
-                        paste_tensor_optionalMax(self.preallocated_dummy_target[b, c], target_structure[b], bboxes[b][c + 1], use_max=False)
-                    else:
-                        pass
-
-        loss = self.bce(net_output, self.preallocated_dummy_target)
-        n = max(1, round(np.prod(loss.shape[-3:]) * sample_scalar(self.k) / 100))
-        loss = loss.view((*loss.shape[:2], -1))
-        loss = topk(loss, k=n, sorted=False)[0]
-        loss = loss.mean()
-        return loss
-
-
 class ConvertSegToLandmarkTarget(BasicTransform):
     def __init__(self,
                  n_landmarks: int,
@@ -264,12 +228,125 @@ class ConvertSegToLandmarkTarget(BasicTransform):
         return data_dict
 
 
+# ******************************************************** LOSS FUNCTIONS ********************************************************
+
+
+class BCE_topK_loss_landmark(nn.Module):
+    def __init__(self, k: RandomScalar = 100):
+        super().__init__()
+        self.bce = BCEWithLogitsLoss(reduction='none')
+        # for topk k must be int with k being the number of elements that are returned. We use k as a percentage here,
+        # so k=5 will mean top 5 % of pixels!
+        self.k = k
+        self.preallocated_dummy_target: torch.Tensor = None
+
+    def forward(self, net_output: torch.Tensor, target_structure: torch.Tensor, bboxes):
+        # net_output is b, c, x, y, z
+        # target_structure is a list of tensors x, y, z
+        # bboxes is a list of dicts mapping an index to a bbox
+        if self.preallocated_dummy_target is None:
+            self.preallocated_dummy_target = torch.zeros(net_output.shape, device=net_output.device,
+                                                         dtype=torch.float32)
+
+        with torch.no_grad():
+            self.preallocated_dummy_target.zero_()
+
+            for b in range(net_output.shape[0]):
+                for c in range(net_output.shape[1]):
+                    # insert into preallocated_dummy_target
+                    if c + 1 in bboxes[b].keys():
+                        paste_tensor_optionalMax(self.preallocated_dummy_target[b, c], target_structure[b], bboxes[b][c + 1], use_max=False)
+                    else:
+                        pass
+
+        loss = self.bce(net_output, self.preallocated_dummy_target)
+        n = max(1, round(np.prod(loss.shape[-3:]) * sample_scalar(self.k) / 100))
+        loss = loss.view((*loss.shape[:2], -1))
+        loss = topk(loss, k=n, sorted=False)[0]
+        loss = loss.mean()
+        return loss
+    
+class MSE_loss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.preallocated_dummy_target: torch.Tensor = None
+
+    def forward(self, net_output, target_structure, bboxes):
+        if (self.preallocated_dummy_target is None or
+            self.preallocated_dummy_target.shape != net_output.shape or
+            self.preallocated_dummy_target.dtype  != net_output.dtype or
+            self.preallocated_dummy_target.device != net_output.device):
+            self.preallocated_dummy_target = torch.zeros_like(net_output)
+
+        with torch.no_grad():
+            self.preallocated_dummy_target.zero_()
+            for b in range(net_output.shape[0]):
+                for c in range(net_output.shape[1]):
+                    if c + 1 in bboxes[b]:
+                        paste_tensor_optionalMax(
+                            self.preallocated_dummy_target[b, c],
+                            target_structure[b],
+                            bboxes[b][c + 1],
+                            use_max=False
+                        )
+
+        pred = torch.sigmoid(net_output)  # not F.sigmoid
+        # NOTE: this averages over all voxels (background-dominated)
+        return F.mse_loss(pred, self.preallocated_dummy_target)
+
+class MSE_topK_loss(nn.Module):
+    def __init__(self, k: RandomScalar = 100):
+        super().__init__()
+        # k is percentage of voxels to keep per (b,c)
+        self.k = k
+        self.preallocated_dummy_target: torch.Tensor = None
+
+    def _ensure_buffer(self, like: torch.Tensor):
+        if (self.preallocated_dummy_target is None or
+            self.preallocated_dummy_target.shape != like.shape or
+            self.preallocated_dummy_target.dtype  != like.dtype or
+            self.preallocated_dummy_target.device != like.device):
+            # match dtype/device (important for mixed precision)
+            self.preallocated_dummy_target = torch.zeros_like(like)
+
+    def forward(self, net_output: torch.Tensor, target_structure, bboxes):
+        # net_output: [B, C, X, Y, Z] (or 2D -> [B, C, H, W])
+        self._ensure_buffer(net_output)
+
+        with torch.no_grad():
+            self.preallocated_dummy_target.zero_()
+            # fill the dummy target inside the provided bboxes
+            for b in range(net_output.shape[0]):
+                for c in range(net_output.shape[1]):
+                    if c + 1 in bboxes[b]:
+                        paste_tensor_optionalMax(
+                            self.preallocated_dummy_target[b, c],
+                            target_structure[b],
+                            bboxes[b][c + 1],
+                            use_max=False
+                        )
+
+        # logits -> probabilities in [0,1] for MSE
+        pred = torch.sigmoid(net_output)
+
+        # per-voxel squared error (no reduction)
+        per_voxel = (pred - self.preallocated_dummy_target) ** 2  # [B, C, ...]
+        B, C = per_voxel.shape[:2]
+        spatial = per_voxel.shape[2:]
+        N = int(np.prod(spatial))
+        n = max(1, round(N * sample_scalar(self.k) / 100))
+
+        # top-k over spatial dims per (b, c)
+        per_voxel = per_voxel.view(B, C, -1)
+        topk_vals = torch.topk(per_voxel, k=n, dim=-1, sorted=False).values
+        loss = topk_vals.mean()
+        return loss
 
 
 
-# **********************************************************************************************
-# ********************************* FABIS NN LANDMARK TRAINER **********************************
-# **********************************************************************************************
+# *******************************************************************************************************************************************
+# ******************************************************** FABIS NN LANDMARK TRAINER ********************************************************
+# *******************************************************************************************************************************************
 
 
 
@@ -755,7 +832,7 @@ class nnLandmark_trainer(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT2
                 #
                 #         sitk.WriteImage(prediction_uncropped_itk, join(validation_output_folder, k + f'__{i:03d}.nii.gz'))
 
-        evaluate_MRE(validation_output_folder, join(nnUNet_raw, self.plans_manager.dataset_name, 'landmark_coordinates.json'))
+        evaluate_MRE(validation_output_folder, join(nnUNet_raw, self.plans_manager.dataset_name, 'all_landmarks_voxel.json'))
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
@@ -902,22 +979,20 @@ class nnLandmark_trainer_edt7(nnLandmark_trainer):
 
 
 
-# **********************************************************************************************
-# ********************************* ALEX CHANGED STUFF HERE ************************************
-# **********************************************************************************************
+# *****************************************************************************************************************************************
+# ******************************************************** ALEX CHANGED STUFF HERE ********************************************************
+# *****************************************************************************************************************************************
 
 
 
 
-class nnLandmark(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT25):
+class nnLandmark_fabi(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT25):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
-        self.edt_radius = 15
+        self.blobb_radius = 15
         self.enable_deep_supervision = False
-        self.num_epochs = 1
-        self.num_val_iterations_per_epoch = 1
-        self.num_iterations_per_epoch = 1
+        self.blobb_type = 'EDT'
 
     def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
         """
@@ -1122,7 +1197,6 @@ class nnLandmark(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT25):
 
         return transforms
 
-
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
                                    arch_init_kwargs: dict,
@@ -1146,8 +1220,8 @@ class nnLandmark(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT25):
         transforms: ComposeTransforms = nnUNetTrainer.get_validation_transforms(deep_supervision_scales, is_cascaded,
                                                                                 foreground_labels, regions,
                                                                                 ignore_label)
-        transforms.transforms.append(ConvertSegToLandmarkTarget(len(self.label_manager.foreground_labels), 'EDT',
-                                                        edt_radius=self.edt_radius))
+        transforms.transforms.append(ConvertSegToLandmarkTarget(len(self.label_manager.foreground_labels), self.blobb_type,
+                                                        edt_radius=self.blobb_radius))
         return transforms
 
     def perform_actual_validation(self, save_probabilities: bool = False):
@@ -1304,7 +1378,7 @@ class nnLandmark(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT25):
                 #
                 #         sitk.WriteImage(prediction_uncropped_itk, join(validation_output_folder, k + f'__{i:03d}.nii.gz'))
 
-        evaluate_MRE(validation_output_folder, join(nnUNet_raw, self.plans_manager.dataset_name, 'landmark_coordinates.json'))
+        evaluate_MRE(validation_output_folder, join(nnUNet_raw, self.plans_manager.dataset_name, 'all_landmarks_voxel.json'))
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
@@ -1440,3 +1514,231 @@ class nnLandmark(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT25):
         _ = next(mt_gen_train)
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
+    
+
+class nnLandmark_v1(nnLandmark_fabi):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.blobb_radius = 4
+        self.enable_deep_supervision = False
+        self.blobb_type = 'Gaussian'
+        self.initial_lr = 5e-4
+        self.grad_clip = 0.05
+
+    def get_training_transforms(
+            self, patch_size: Union[np.ndarray, Tuple[int]],
+            rotation_for_DA: RandomScalar,
+            deep_supervision_scales: Union[List, Tuple, None],
+            mirror_axes: Tuple[int, ...],
+            do_dummy_2d_data_aug: bool,
+            use_mask_for_norm: List[bool] = None,
+            is_cascaded: bool = False,
+            foreground_labels: Union[Tuple[int, ...], List[int]] = None,
+            regions: List[Union[List[int], Tuple[int, ...], int]] = None,
+            ignore_label: int = None,
+    ) -> BasicTransform:
+        """
+        Set back to the original nnUNet data augmentation. 
+        """
+        #matching_axes = np.array([sum([i == j for j in patch_size]) for i in patch_size])
+        #valid_axes = list(np.where(matching_axes == np.max(matching_axes))[0])
+        transforms = []
+
+        if do_dummy_2d_data_aug:
+            ignore_axes = (0,)
+            transforms.append(Convert3DTo2DTransform())
+            patch_size_spatial = patch_size[1:]
+        else:
+            patch_size_spatial = patch_size
+            ignore_axes = None
+        transforms.append(
+            SpatialTransform(
+                patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
+                p_rotation=0.2,
+                rotation=rotation_for_DA, p_scaling=0.2, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
+                bg_style_seg_sampling=False  # , mode_seg='nearest'
+            )
+        )
+
+        if do_dummy_2d_data_aug:
+            transforms.append(Convert2DTo3DTransform())
+
+        transforms.append(RandomTransform(
+            GaussianNoiseTransform(
+                noise_variance=(0, 0.1),
+                p_per_channel=1,
+                synchronize_channels=True
+            ), apply_probability=0.1
+        ))
+        transforms.append(RandomTransform(
+            GaussianBlurTransform(
+                blur_sigma=(0.5, 1.),
+                synchronize_channels=False,
+                synchronize_axes=False,
+                p_per_channel=0.5, benchmark=True
+            ), apply_probability=0.2
+        ))
+        transforms.append(RandomTransform(
+            MultiplicativeBrightnessTransform(
+                multiplier_range=BGContrast((0.75, 1.25)),
+                synchronize_channels=False,
+                p_per_channel=1
+            ), apply_probability=0.15
+        ))
+        transforms.append(RandomTransform(
+            ContrastTransform(
+                contrast_range=BGContrast((0.75, 1.25)),
+                preserve_range=True,
+                synchronize_channels=False,
+                p_per_channel=1
+            ), apply_probability=0.15
+        ))
+        transforms.append(RandomTransform(
+            SimulateLowResolutionTransform(
+                scale=(0.5, 1),
+                synchronize_channels=False,
+                synchronize_axes=True,
+                ignore_axes=ignore_axes,
+                allowed_channels=None,
+                p_per_channel=0.5
+            ), apply_probability=0.25
+        ))
+        transforms.append(RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.7, 1.5)),
+                p_invert_image=1,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1
+            ), apply_probability=0.1
+        ))
+        transforms.append(RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.7, 1.5)),
+                p_invert_image=0,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1
+            ), apply_probability=0.3
+        ))
+        if mirror_axes is not None and len(mirror_axes) > 0:
+            transforms.append(
+                MirrorTransform(
+                    allowed_axes=mirror_axes
+                )
+            )
+
+        if use_mask_for_norm is not None and any(use_mask_for_norm):
+            transforms.append(MaskImageTransform(
+                apply_to_channels=[i for i in range(len(use_mask_for_norm)) if use_mask_for_norm[i]],
+                channel_idx_in_seg=0,
+                set_outside_to=0,
+            ))
+
+        transforms.append(
+            RemoveLabelTansform(-1, 0)
+        )
+        if is_cascaded:
+            assert foreground_labels is not None, 'We need foreground_labels for cascade augmentations'
+            transforms.append(
+                MoveSegAsOneHotToDataTransform(
+                    source_channel_idx=1,
+                    all_labels=foreground_labels,
+                    remove_channel_from_source=True
+                )
+            )
+            transforms.append(
+                RandomTransform(
+                    ApplyRandomBinaryOperatorTransform(
+                        channel_idx=list(range(-len(foreground_labels), 0)),
+                        strel_size=(1, 8),
+                        p_per_label=1
+                    ), apply_probability=0.4
+                )
+            )
+            transforms.append(
+                RandomTransform(
+                    RemoveRandomConnectedComponentFromOneHotEncodingTransform(
+                        channel_idx=list(range(-len(foreground_labels), 0)),
+                        fill_with_other_class_p=0,
+                        dont_do_if_covers_more_than_x_percent=0.15,
+                        p_per_label=1
+                    ), apply_probability=0.2
+                )
+            )
+
+        if regions is not None:
+            # the ignore label must also be converted
+            transforms.append(
+                ConvertSegmentationToRegionsTransform(
+                    regions=list(regions) + [ignore_label] if ignore_label is not None else regions,
+                    channel_in_seg=0
+                )
+            )
+
+        transforms.append(ConvertSegToLandmarkTarget(len(self.label_manager.foreground_labels), self.blobb_type,
+                                                        edt_radius=self.blobb_radius))
+
+        transforms = ComposeTransforms(transforms)
+
+        return transforms
+
+    def get_validation_transforms(self,
+                                  deep_supervision_scales: Union[List, Tuple, None],
+                                  is_cascaded: bool = False,
+                                  foreground_labels: Union[Tuple[int, ...], List[int]] = None,
+                                  regions: List[Union[List[int], Tuple[int, ...], int]] = None,
+                                  ignore_label: int = None,
+                                  ) -> BasicTransform:
+        transforms: ComposeTransforms = nnUNetTrainer.get_validation_transforms(deep_supervision_scales, is_cascaded,
+                                                                                foreground_labels, regions,
+                                                                                ignore_label)
+        transforms.transforms.append(ConvertSegToLandmarkTarget(len(self.label_manager.foreground_labels), self.blobb_type,
+                                                        edt_radius=self.blobb_radius))
+        return transforms
+
+    def train_step(self, batch: dict) -> dict:
+        data = batch['data']
+
+        data = data.to(self.device, non_blocking=True)
+        target_structure = [i.to(self.device, non_blocking=True) for i in batch['target_struct']]
+
+        self.optimizer.zero_grad(set_to_none=True)
+        # Autocast can be annoying
+        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
+        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+        # So autocast will only be active if we have a cuda device.
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            output = self.network(data)
+            # import IPython;IPython.embed()
+            # if False:
+            #     from batchviewer import view_batch
+            #     view_batch(data[0], target[0][0], F.sigmoid(output[0][0]))
+
+         # take loss out of autocast! Sigmoid is not stable in fp16
+        l = self.loss(output, target_structure, batch['bboxes'])
+
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(l).backward()
+            self.grad_scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.grad_clip)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.grad_clip)
+            self.optimizer.step()
+        return {'loss': l.detach().cpu().numpy()}
+
+    def _build_loss(self):
+        loss = MSE_loss()
+
+        # if self._do_i_compile():
+        #     loss.dc = torch.compile(loss.soft_dice)
+
+        # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
+        # this gives higher resolution outputs more weight in the loss
+
+        assert not self.enable_deep_supervision, 'bruh.'
+        return loss

@@ -13,11 +13,11 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "733",
+                "732",
                 "3d_fullres",
                 "0",
                 "-tr",
-                "nnLandmark"
+                "nnLandmark_v1"
             ]
         }
     ]
