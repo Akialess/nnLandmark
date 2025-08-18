@@ -201,10 +201,10 @@ def load_spacing_map(spacing_json_path: str):
     out = {}
     for k, v in raw.items():
         if isinstance(v, dict):
-            if "spacing" in v:
-                out[k] = [float(x) for x in v["spacing"]]
-            elif "image_spacing" in v:
+            if "image_spacing" in v:
                 out[k] = [float(x) for x in v["image_spacing"]]
+            elif "annotation_spacing" in v and v["annotation_spacing"] is not None:
+                out[k] = [float(x) for x in v["annotation_spacing"]]
             else:
                 raise ValueError(f"Unrecognized dict format for case '{k}': {v}")
         elif isinstance(v, (list, tuple)) and len(v) == 3:
