@@ -160,10 +160,19 @@ def paste_tensor_optionalMax(target, source, bbox, use_max=False):
 
     tz0, tz1 = target_indices[0]
     ty0, ty1 = target_indices[1]
-    tx0, tx1 = target_indices[2]
+    if len(target_shape) == 2:
+        #2D
+        pass
+    else:
+        tx0, tx1 = target_indices[2]
+
     sz0, sz1 = source_indices[0]
     sy0, sy1 = source_indices[1]
-    sx0, sx1 = source_indices[2]
+    if len(target_shape) == 2:
+        #2D
+        pass
+    else:
+        sx0, sx1 = source_indices[2]
 
     if use_max:
         target[tz0:tz1, ty0:ty1, tx0:tx1] = xp.maximum(
@@ -171,7 +180,11 @@ def paste_tensor_optionalMax(target, source, bbox, use_max=False):
             source[sz0:sz1, sy0:sy1, sx0:sx1]
         )
     else:
-        target[tz0:tz1, ty0:ty1, tx0:tx1] = source[sz0:sz1, sy0:sy1, sx0:sx1]
+        if len(target_shape) == 2:
+            #2D
+            target[tz0:tz1, ty0:ty1] = source[sz0:sz1, sy0:sy1]
+        else:
+            target[tz0:tz1, ty0:ty1, tx0:tx1] = source[sz0:sz1, sy0:sy1, sx0:sx1]
 
     return target
 

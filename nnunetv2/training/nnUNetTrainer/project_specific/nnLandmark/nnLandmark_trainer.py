@@ -321,7 +321,11 @@ class ConvertSegToLandmarkTarget(BasicTransform):
 
         # now place gaussian or etd on these coordinates
         if self.target_type == 'EDT':
-            target = build_point(tuple([self.edt_radius] * 3), use_distance_transform=True, binarize=False)
+            if seg.shape[0] == 1:
+                # 2D image
+                target = build_point((1, self.edt_radius, self.edt_radius), use_distance_transform=True, binarize=False)
+            else:
+                target = build_point(tuple([self.edt_radius] * 3), use_distance_transform=True, binarize=False)
         else:
             target = torch.from_numpy(gaussian_kernel_3d(self.gaussian_sigma))
             target /= target.max()
@@ -375,12 +379,22 @@ class BCE_topK_loss_landmark(nn.Module):
                 for c in range(net_output.shape[1]):
                     # insert into preallocated_dummy_target
                     if c + 1 in bboxes[b].keys():
-                        paste_tensor_optionalMax(self.preallocated_dummy_target[b, c], target_structure[b], bboxes[b][c + 1], use_max=False)
+                        if len(net_output.shape) == 4:
+                            # 2D
+                            paste_tensor_optionalMax(self.preallocated_dummy_target[b, c], target_structure[b][0], bboxes[b][c + 1][1:], use_max=False)
+                        else:
+                            paste_tensor_optionalMax(self.preallocated_dummy_target[b, c], target_structure[b], bboxes[b][c + 1], use_max=False)
                     else:
                         pass
 
         loss = self.bce(net_output, self.preallocated_dummy_target)
-        n = max(1, round(np.prod(loss.shape[-3:]) * sample_scalar(self.k) / 100))
+        
+        if len(loss.shape) == 4:
+            # 2D
+            n = max(1, round(np.prod(loss.shape[-2:]) * sample_scalar(self.k) / 100))
+        else:
+            n = max(1, round(np.prod(loss.shape[-3:]) * sample_scalar(self.k) / 100))
+        
         loss = loss.view((*loss.shape[:2], -1))
         loss = topk(loss, k=n, sorted=False)[0]
         loss = loss.mean()
@@ -1089,7 +1103,8 @@ class nnLandmark_trainer(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT2
                                  oversample_foreground_percent=self.oversample_foreground_percent,
                                  sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
                                  probabilistic_oversampling=self.probabilistic_oversampling,
-                                 random_offset=[i // 3 for i in self.configuration_manager.patch_size])
+                                 #random_offset=[i // 3 for i in self.configuration_manager.patch_size]
+                                 )
         dl_val = nnLandmarkLoader(dataset_val, self.batch_size,
                                   self.configuration_manager.patch_size,
                                   self.configuration_manager.patch_size,
@@ -1097,7 +1112,8 @@ class nnLandmark_trainer(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT2
                                   oversample_foreground_percent=self.oversample_foreground_percent,
                                   sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
                                   probabilistic_oversampling=self.probabilistic_oversampling,
-                                  random_offset=[i // 3 for i in self.configuration_manager.patch_size])
+                                  #random_offset=[i // 3 for i in self.configuration_manager.patch_size]
+                                  )
 
         allowed_num_processes = get_allowed_n_proc_DA()
         if allowed_num_processes == 0:

@@ -6,19 +6,19 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run nnUNet training",
+            "name": "nnUNet training",
             "type": "debugpy",
             "request": "launch",
             "program": "nnunetv2/run/run_training.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "732",
-                "3d_fullres",
+                "738",
+                "2d",
                 "0",
                 "-tr",
-                "nnLandmark_v1",
-                //"--val"
+                "nnLandmark_fabi",
+                // "--val"
             ]
         },
         {
@@ -30,17 +30,17 @@
             "justMyCode": false,
             "args": [
                 "-i",
-                "/home/a332l/dev/Project_nnLandmark/nnunet_data/nnUNet_raw/Dataset734_Fetal_pose/imagesTs/",
+                "/home/a332l/dev/Project_nnLandmark/nnunet_data/nnUNet_raw/Dataset736_Fetal_face/imagesTs/",
                 "-o",
-                "/home/a332l/dev/Project_nnLandmark/evaluation/Dataset734_Fetal_pose/nnLandmark_fabi/prediction/",
+                "/home/a332l/dev/Project_nnLandmark/evaluation/Dataset736_Fetal_face/nnLandmark_fabi/prediction/",
                 "-d",
-                "734",
+                "736",
                 "-c",
                 "3d_fullres",
                 "-tr",
                 "nnLandmark_fabi",
-                "-f",
-                "0"
+                //"-f",
+                //"0", "1", "2", "3",
             ]
         },
         {
@@ -54,9 +54,9 @@
                 "--nnUNet_raw",
                 "/home/a332l/dev/Project_nnLandmark/nnunet_data/nnUNet_raw/",
                 "--dataset_name",
-                "Dataset735_MML_comp",
+                "Dataset736_Fetal_face",
                 "--predictions",
-                "/home/a332l/dev/Project_nnLandmark/evaluation/Dataset735_MML_comp/test/nnLandmark_fabi/prediction/",
+                "/home/a332l/dev/Project_nnLandmark/evaluation/Dataset736_Fetal_face/nnLandmark_fabi/prediction/",
             ]
         }
     ]
