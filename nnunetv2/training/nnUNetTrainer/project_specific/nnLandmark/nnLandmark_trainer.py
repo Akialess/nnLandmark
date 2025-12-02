@@ -71,6 +71,8 @@ from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
 from nnunetv2.utilities.helpers import dummy_context, empty_cache
 
+from nnunetv2.training.nnUNetTrainer.project_specific.nnLandmark.landmark_architectures.BiFormer_Unet import BiFormer_Unet
+
 
 # *******************************************************************************************************************************************
 # **************************************************** EVALUATION HELPERS *******************************************************************
@@ -912,8 +914,12 @@ class nnLandmark_trainer(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep_EDT2
                 # revert cropping
                 crop_offset = [i[0] for i in properties['bbox_used_for_cropping']]
                 new_coordinates = [[k + crop_offset[l] for l, k in enumerate(i)] for i in new_coordinates]
-                # alex: change x and z coordinates
-                new_coordinates = [[coord[2], coord[1], coord[0]] for coord in new_coordinates]
+                # alex: changed x and z coordinates
+                if len(new_coordinates[0]) == 2:
+                    # 2
+                    new_coordinates = [[coord[1], coord[0]] for coord in new_coordinates]
+                else:
+                    new_coordinates = [[coord[2], coord[1], coord[0]] for coord in new_coordinates]
 
                 # we need to export the coordinates as segs before we invert nibabel reorient
                 # export coordinates
@@ -1407,3 +1413,43 @@ class nnLandmark_v1(nnLandmark_fabi):
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=800, gamma=0.1)
 
         return optimizer, lr_scheduler   
+
+    
+class nnLandmark_fabi_BiFormerUnet(nnLandmark_fabi):
+
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+
+        self.num_epochs=1
+        self.num_iterations_per_epoch=1
+        self.num_val_iterations_per_epoch=1
+
+    @staticmethod
+    def build_network_architecture(architecture_class_name: str,
+                                   arch_init_kwargs: dict,
+                                   arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+                                   num_input_channels: int,
+                                   num_output_channels: int,
+                                   enable_deep_supervision: bool = True) -> nn.Module:
+        """
+        Override to return your BiFormer_Unet instead of nnU-Net default architecture
+        """
+        # Extract relevant params for BiFormer_Unet (customize as needed)
+        return BiFormer_Unet(
+            n_class=num_output_channels-1,
+            in_chans=num_input_channels,
+            embed_dim=[64, 128, 256, 512],  # adjust based on your plans/patch size
+            depth=[2, 2, 6, 2],             # adjust based on your plans
+            # Add other BiFormer params as needed
+            head_dim=8,
+            layer_scale_init_value=-1,
+            drop_path_rate=0.1,
+        )
+    
+    def set_deep_supervision_enabled(self, enabled: bool):
+        """
+        This function is specific for the default architecture in nnU-Net. If you change the architecture, there are
+        chances you need to change this as well!
+        """
+        print("Use custom model with BiFormer_Unet architecture - skipping deep supervision setup.")
