@@ -421,6 +421,16 @@ class BiFormer_Unet(nn.Module):
         return outs
 
     def forward(self, x):
+        """
+        Expect input x with layout (B, C, Z, X, Y).
+        Internally we permute to (B, C, X, Y, Z) so Conv3d/Pool operate on (D=X, H=Y, W=Z).
+        At the end we permute the model output back to (B, C_out, Z, X, Y).
+        """
+        # convert layout from (B, C, Z, X, Y) -> (B, C, X, Y, Z)
+        # original axes: 0=B,1=C,2=Z,3=X,4=Y
+        # target axes:   0=B,1=C,2=X,3=Y,4=Z  -> permute(0,1,3,4,2)
+        x = x.permute(0, 1, 3, 4, 2).contiguous()
+
         moving = x[:, 0:1, :, :]  # [2, 1, 160, 192, 224]
         # print(x.size(),"--------------0")
         x_s0 = x.clone()  # [2, 2, 160, 192, 224]
@@ -450,6 +460,11 @@ class BiFormer_Unet(nn.Module):
         # flow = self.reg_head(x)  # [2, 3, 160, 192, 224]
         # out = self.spatial_trans(moving, flow)  # [2, 1, 160, 192, 224]
         # return out, flow
+        
+        # Convert output back to original layout: (B, C_out, X, Y, Z) -> (B, C_out, Z, X, Y)
+        # permute indices: (0,1,2,3,4) -> (0,1,4,2,3)
+        out = out.permute(0, 1, 4, 2, 3).contiguous()
+
         return out
 
 
