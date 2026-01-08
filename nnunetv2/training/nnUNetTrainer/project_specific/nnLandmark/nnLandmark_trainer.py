@@ -72,6 +72,7 @@ from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
 from nnunetv2.utilities.helpers import dummy_context, empty_cache
 
 from nnunetv2.training.nnUNetTrainer.project_specific.nnLandmark.landmark_architectures.BiFormer_Unet import BiFormer_Unet
+from nnunetv2.training.nnUNetTrainer.project_specific.nnLandmark.landmark_architectures.nnMambaSeg import nnMambaSeg
 
 # *******************************************************************************************************************************************
 # **************************************************** EVALUATION HELPERS *******************************************************************
@@ -1413,9 +1414,20 @@ class nnLandmark_v1(nnLandmark_fabi):
 
         return optimizer, lr_scheduler   
 
-    
-class nnLandmark_fabi_BiFormerUnet(nnLandmark_fabi):
 
+
+
+# ***********************************************************************************************************
+# ******************************** OTHER METHODS ARCHITECTURES **********************************************
+# ***********************************************************************************************************
+
+
+class nnLandmark_fabi_BiFormerUnet(nnLandmark_fabi):
+    '''
+    One of nnLandmark baselines. Uses BiFormer_Unet as the network architecture.
+    https://arxiv.org/abs/2502.14221
+    https://github.com/ECNUACRush/H3DE-Net
+    '''
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
                                    arch_init_kwargs: dict,
@@ -1425,6 +1437,7 @@ class nnLandmark_fabi_BiFormerUnet(nnLandmark_fabi):
                                    enable_deep_supervision: bool = True) -> nn.Module:
         """
         Override to return your BiFormer_Unet instead of nnU-Net default architecture
+
         """
         # Extract relevant params for BiFormer_Unet (customize as needed)
         return BiFormer_Unet(
@@ -1437,10 +1450,26 @@ class nnLandmark_fabi_BiFormerUnet(nnLandmark_fabi):
             layer_scale_init_value=-1,
             drop_path_rate=0.1,
         )
-    
-    def set_deep_supervision_enabled(self, enabled: bool):
+
+
+class nnLandmark_fabi_nnMambaSeg(nnLandmark_fabi):
+    '''
+    One of nnLandmark baselines. Uses nnMambaSeg as the network architecture.
+    https://ieeexplore.ieee.org/document/10980694
+    https://github.com/lhaof/nnMamba
+    '''
+    @staticmethod
+    def build_network_architecture(architecture_class_name: str,
+                                   arch_init_kwargs: dict,
+                                   arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+                                   num_input_channels: int,
+                                   num_output_channels: int,
+                                   enable_deep_supervision: bool = True) -> nn.Module:
         """
-        This function is specific for the default architecture in nnU-Net. If you change the architecture, there are
-        chances you need to change this as well!
+        Override to return nnMambaSeg instead of nnU-Net default architecture
+
         """
-        print("Use custom model with BiFormer_Unet architecture - skipping deep supervision setup.")
+        return nnMambaSeg(
+            in_channels=num_input_channels,
+            out_channels=num_output_channels-1,
+        )
