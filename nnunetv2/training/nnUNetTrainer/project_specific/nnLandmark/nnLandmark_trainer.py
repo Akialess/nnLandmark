@@ -1450,6 +1450,14 @@ class nnLandmark_fabi_BiFormerUnet(nnLandmark_fabi):
             layer_scale_init_value=-1,
             drop_path_rate=0.1,
         )
+    
+    def set_deep_supervision_enabled(self, enabled: bool):
+        """
+        This function is specific for the default architecture in nnU-Net. If you change the architecture, there are
+        chances you need to change this as well!
+        """
+        print("Deep supervision toggle not implemented for BiFormer_Unet. Ignoring.")
+
 
 
 class nnLandmark_fabi_nnMambaSeg(nnLandmark_fabi):
@@ -1470,6 +1478,13 @@ class nnLandmark_fabi_nnMambaSeg(nnLandmark_fabi):
 
         """
         return nnMambaSeg(
-            in_channels=num_input_channels,
-            out_channels=num_output_channels-1,
+            in_ch=num_input_channels,
+            number_classes=num_output_channels-1,
         )
+    
+    def set_deep_supervision_enabled(self, enabled: bool):
+        """
+        This function is specific for the default architecture in nnU-Net. If you change the architecture, there are
+        chances you need to change this as well!
+        """
+        print("Deep supervision toggle not implemented for nnMambaSeg. Ignoring.")
