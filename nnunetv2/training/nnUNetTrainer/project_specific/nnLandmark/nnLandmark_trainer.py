@@ -1346,12 +1346,6 @@ class nnLandmark_fabi(nnLandmark_trainer):
         return transforms
 
 
-class nnLandmark_fabi_edt7(nnLandmark_fabi):
-    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
-                 device: torch.device = torch.device('cuda')):
-        super().__init__(plans, configuration, fold, dataset_json, device)
-        self.blobb_radius = 7
-
 class nnLandmark_v1(nnLandmark_fabi):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
@@ -1484,6 +1478,30 @@ class nnLandmark_fabi_MSE(nnLandmark_fabi):
         assert not self.enable_deep_supervision, 'bruh.'
         return loss
     
+class nnLandmark_fabi_edt7(nnLandmark_fabi):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.blobb_radius = 7
+
+class nnLandmark_fabi_edt11(nnLandmark_fabi):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.blobb_radius = 11
+
+class nnLandmark_fabi_edt19(nnLandmark_fabi):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.blobb_radius = 19
+
+class nnLandmark_fabi_edt23(nnLandmark_fabi):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.blobb_radius = 23
+
 
 # ***********************************************************************************************************
 # ******************************** OTHER METHODS ARCHITECTURES **********************************************
