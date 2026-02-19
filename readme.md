@@ -1,140 +1,190 @@
-# Welcome to the new nnU-Net!
+# Welcome to nnLandmark!
 
-Click [here](https://github.com/MIC-DKFZ/nnUNet/tree/nnunetv1) if you were looking for the old one instead.
+This repository contains the implementation of nnLandmark, a self-configuring framework for 3D medical landmark detection.
 
-Coming from V1? Check out the [TLDR Migration Guide](documentation/tldr_migration_guide_from_v1.md). Reading the rest of the documentation is still strongly recommended ;-)
+The repository you see here is a fork of [nnU-Net](https://github.com/MIC-DKFZ/nnUNet). Please head over there to read more about it.
 
-## **2024-04-18 UPDATE: New residual encoder UNet presets available!**
-Residual encoder UNet presets substantially improve segmentation performance.
-They ship for a variety of GPU memory targets. It's all awesome stuff, promised! 
-Read more :point_right: [here](documentation/resenc_presets.md) :point_left:
+<!-- #### Read the paper: &nbsp; &nbsp;   [![arXiv](https://img.shields.io/badge/arXiv-2404.03010-B31B1B.svg)](https://arxiv.org/abs/2404.03010) -->
+<!-- TODO: add MIDL paper-->
 
-Also check out our [new paper](https://arxiv.org/pdf/2404.09556.pdf) on systematically benchmarking recent developments in medical image segmentation. You might be surprised!
+Copyright German Cancer Research Center (DKFZ) and contributors. Please make sure that your usage of this code is in compliance with its license.
 
-# What is nnU-Net?
-Image datasets are enormously diverse: image dimensionality (2D, 3D), modalities/input channels (RGB image, CT, MRI, microscopy, ...), 
-image sizes, voxel sizes, class ratio, target structure properties and more change substantially between datasets. 
-Traditionally, given a new problem, a tailored solution needs to be manually designed and optimized  - a process that 
-is prone to errors, not scalable and where success is overwhelmingly determined by the skill of the experimenter. Even 
-for experts, this process is anything but simple: there are not only many design choices and data properties that need to 
-be considered, but they are also tightly interconnected, rendering reliable manual pipeline optimization all but impossible! 
+## Installation
+We strongly recommend installing this in a dedicated virtual environment (for example conda).
+We recommend using a Linux based operating system, for example Ubuntu. Windows should work as well but is not tested.
 
-![nnU-Net overview](documentation/assets/nnU-Net_overview.png)
+Some dependencies should be installed manually:
+- Install pytorch according to the instructions on the [pytorch website](https://pytorch.org/get-started/locally/). We recommend at least version 2.7. Pick the correct CUDA version for your system. Higher is better.
+- Install batchgeneratorsv2 via `pip install git+https://github.com/MIC-DKFZ/batchgeneratorsv2.git@07541d7eb5a4839aa4a5e494a123f3fe69ccfd4f`
 
-**nnU-Net is a semantic segmentation method that automatically adapts to a given dataset. It will analyze the provided 
-training cases and automatically configure a matching U-Net-based segmentation pipeline. No expertise required on your 
-end! You can simply train the models and use them for your application**.
+Now you can just clone this repository and install it:
 
-Upon release, nnU-Net was evaluated on 23 datasets belonging to competitions from the biomedical domain. Despite competing 
-with handcrafted solutions for each respective dataset, nnU-Net's fully automated pipeline scored several first places on 
-open leaderboards! Since then nnU-Net has stood the test of time: it continues to be used as a baseline and method 
-development framework ([9 out of 10 challenge winners at MICCAI 2020](https://arxiv.org/abs/2101.00232) and 5 out of 7 
-in MICCAI 2021 built their methods on top of nnU-Net, 
- [we won AMOS2022 with nnU-Net](https://amos22.grand-challenge.org/final-ranking/))!
+```commandline
+git clone https://github.com/MIC-DKFZ/nnLandmark.git`
+cd nnLandmark
+pip install -e .
+```
 
-Please cite the [following paper](https://www.google.com/url?q=https://www.nature.com/articles/s41592-020-01008-z&sa=D&source=docs&ust=1677235958581755&usg=AOvVaw3dWL0SrITLhCJUBiNIHCQO) when using nnU-Net:
+## Data Format
 
-    Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). nnU-Net: a self-configuring 
-    method for deep learning-based biomedical image segmentation. Nature methods, 18(2), 203-211.
+### Path setup
+We are using the same paths as nnU-Net, defined as environment variables pointing it to raw data, preprocessed data and results. Set them with
+
+```
+export nnUNet_results=/home/isensee/nnUNet_results
+export nnUNet_preprocessed=/home/isensee/nnUNet_preprocessed
+export nnUNet_raw=/home/isensee/nnUNet_raw
+```
+Make sure at least `$nnUNet_preprocessed` (but ideally all of them) are on a fast storage such as a local SSD or very good network drive! 
+
+RECOMMENDED: Add these lines to your `.bashrc` file (or whatever you are using) so that the environment variables are set automatically. If you don't do this you need to export them every time you open a new terminal.
+
+### Images and Labels
+ Here we follow the nnU-Net format. The training data is stored in imagesTr and labelsTr folders. The labels are multi-label segmetnation maps. Each landmark class belongs to a specific label value, this must be consistent throughout the dataset! The landmark location is represented by a 3x3x3 cube round the target voxel. Generally the size is irrelevant, as during training the location will be extracted be the center of mass of the segmentation. However, it must be ensured that proximate labels do not overlap, as this would distort the location. 
+
+### Additional JSONs
+
+- dataset.json: Just as in nnU-Net.
+- name_to_label.json: Contains all landmark class names as keys and the respective segmentation label values (starting from 1).
+
+{
+  "landmark_1": 1,
+  "landmark_2": 2,
+}
+
+- spacing.json: This spacing information is used in the evaluation. For each case it contains a image_spacing, taken from the image metadata, and annotation_spacing, taken from the landmark annotation files. This is because some datasets are published with no/wrong image spacing. nnLandmark defaults to look for image_spacing and, if it's null, falls back to annotation_spacing. 
+
+{
+  "case_xyz": {
+    "image_spacing": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "annotation_spacing": null
+  },
+}
+
+- all_landmarks_voxel.json: Voxel coordinate annotations for all cases (train and test). 
+
+{
+  "case_xyz": {
+    "landmark_1": [
+      13,
+      19,
+      89
+    ],
+    "landmark_2": [
+      19,
+      75,
+      85
+    ],
+  }
+}
+
+### Public Dataset Conversion Scripts
+
+We provide dataset conversion scripts under nnunetv2/dataset_conversion/nnLandmark for the following public landmark detection datasets. The folder also contains all train/test splits of the datasets, either the official, published splits or, if not available, the custom split we created and used in the nnLandmark paper MIDL 2026.
+Please check the respective licenses of the datasets before using them!
+
+- AFIDs: https://github.com/afids/afids-data
+- MML: https://github.com/ithet1007/mmld_code
+- DMGLD LFC: https://github.com/lhaof/DGMLD
+- PDDCA 1.4.1: https://www.imagenglab.com/newsite/pddca/ 
+- FeTA 2.4: https://www.synapse.org/Synapse:syn25649159/wiki/610007 
 
 
-## What can nnU-Net do for you?
-If you are a **domain scientist** (biologist, radiologist, ...) looking to analyze your own images, nnU-Net provides 
-an out-of-the-box solution that is all but guaranteed to provide excellent results on your individual dataset. Simply 
-convert your dataset into the nnU-Net format and enjoy the power of AI - no expertise required!
+## Experiment Planning and Preprocessing
 
-If you are an **AI researcher** developing segmentation methods, nnU-Net:
-- offers a fantastic out-of-the-box applicable baseline algorithm to compete against
-- can act as a method development framework to test your contribution on a large number of datasets without having to 
-tune individual pipelines (for example evaluating a new loss function)
-- provides a strong starting point for further dataset-specific optimizations. This is particularly used when competing 
-in segmentation challenges
-- provides a new perspective on the design of segmentation methods: maybe you can find better connections between 
-dataset properties and best-fitting segmentation pipelines?
+We use the experiment planning and preprocessing functionality of nnU-Net as is. 
 
-## What is the scope of nnU-Net?
-nnU-Net is built for semantic segmentation. It can handle 2D and 3D images with arbitrary 
-input modalities/channels. It can understand voxel spacings, anisotropies and is robust even when classes are highly
-imbalanced.
+```bash
+nnUNetv2_plan_and_preprocess \
+     -d DATASET_ID \
+     -c 3d_fullres \
+     --verify_dataset_integrity
+```
+To add the experiment plans for using the ResEncM architecture, our recommendation for the best results, :
 
-nnU-Net relies on supervised learning, which means that you need to provide training cases for your application. The number of 
-required training cases varies heavily depending on the complexity of the segmentation problem. No 
-one-fits-all number can be provided here! nnU-Net does not require more training cases than other solutions - maybe 
-even less due to our extensive use of data augmentation. 
+```bash
+nnUNetv2_plan_experiment \
+    -d DATASET \
+    -pl nnUNetPlannerResEncM
+```
 
-nnU-Net expects to be able to process entire images at once during preprocessing and postprocessing, so it cannot 
-handle enormous images. As a reference: we tested images from 40x40x40 pixels all the way up to 1500x1500x1500 in 3D 
-and 40x40 up to ~30000x30000 in 2D! If your RAM allows it, larger is always possible.
 
-## How does nnU-Net work?
-Given a new dataset, nnU-Net will systematically analyze the provided training cases and create a 'dataset fingerprint'. 
-nnU-Net then creates several U-Net configurations for each dataset: 
-- `2d`: a 2D U-Net (for 2D and 3D datasets)
-- `3d_fullres`: a 3D U-Net that operates on a high image resolution (for 3D datasets only)
-- `3d_lowres` → `3d_cascade_fullres`: a 3D U-Net cascade where first a 3D U-Net operates on low resolution images and 
-then a second high-resolution 3D U-Net refined the predictions of the former (for 3D datasets with large image sizes only)
+## Training
 
-**Note that not all U-Net configurations are created for all datasets. In datasets with small image sizes, the 
-U-Net cascade (and with it the 3d_lowres configuration) is omitted because the patch size of the full 
-resolution U-Net already covers a large part of the input images.**
+Start a nnU-Net training with the nnLandmark trainer. For using the ResEncM architecture plans, add the respective flag:
 
-nnU-Net configures its segmentation pipelines based on a three-step recipe:
-- **Fixed parameters** are not adapted. During development of nnU-Net we identified a robust configuration (that is, certain architecture and training properties) that can 
-simply be used all the time. This includes, for example, nnU-Net's loss function, (most of the) data augmentation strategy and learning rate.
-- **Rule-based parameters** use the dataset fingerprint to adapt certain segmentation pipeline properties by following 
-hard-coded heuristic rules. For example, the network topology (pooling behavior and depth of the network architecture) 
-are adapted to the patch size; the patch size, network topology and batch size are optimized jointly given some GPU 
-memory constraint. 
-- **Empirical parameters** are essentially trial-and-error. For example the selection of the best U-net configuration 
-for the given dataset (2D, 3D full resolution, 3D low resolution, 3D cascade) and the optimization of the postprocessing strategy.
+```bash
+nnUNetv2_train \
+    DATASET_NAME_OR_ID \
+    3d_fullres \
+    FOLD \
+    --tr nnLandmark \
+    -p nnUNetResEncUNetMPlans
+```
 
-## How to get started?
-Read these:
-- [Installation instructions](documentation/installation_instructions.md)
-- [Dataset conversion](documentation/dataset_format.md)
-- [Usage instructions](documentation/how_to_use_nnunet.md)
 
-Additional information:
-- [Learning from sparse annotations (scribbles, slices)](documentation/ignore_label.md)
-- [Region-based training](documentation/region_based_training.md)
-- [Manual data splits](documentation/manual_data_splits.md)
-- [Pretraining and finetuning](documentation/pretraining_and_finetuning.md)
-- [Intensity Normalization in nnU-Net](documentation/explanation_normalization.md)
-- [Manually editing nnU-Net configurations](documentation/explanation_plans_files.md)
-- [Extending nnU-Net](documentation/extending_nnunet.md)
-- [What is different in V2?](documentation/changelog.md)
+## Predictions
 
-Competitions:
-- [AutoPET II](documentation/competitions/AutoPETII.md)
+Use the costum nnLandmark predict script to predict a raw image folder:
 
-[//]: # (- [Ignore label]&#40;documentation/ignore_label.md&#41;)
+```bash
+python nnunetv2/inference/nnLandmark/predict_from_raw_data.py \
+    -i /path/to/nnUNet_raw/DATASET_ID/imagesTs/ \
+    -o /path/to/evaluation/DATASET_ID/predictions/ \
+    -d DATASET_ID \
+    -c 3d_fullres\
+    -tr nnLandmark \
+    -p nnUNetResEncUNetMPlans
+```
 
-## Where does nnU-Net perform well and where does it not perform?
-nnU-Net excels in segmentation problems that need to be solved by training from scratch, 
-for example: research applications that feature non-standard image modalities and input channels,
-challenge datasets from the biomedical domain, majority of 3D segmentation problems, etc . We have yet to find a 
-dataset for which nnU-Net's working principle fails!
+This scrip will create:
 
-Note: On standard segmentation 
-problems, such as 2D RGB images in ADE20k and Cityscapes, fine-tuning a foundation model (that was pretrained on a large corpus of 
-similar images, e.g. Imagenet 22k, JFT-300M) will provide better performance than nnU-Net! That is simply because these 
-models allow much better initialization. Foundation models are not supported by nnU-Net as 
-they 1) are not useful for segmentation problems that deviate from the standard setting (see above mentioned 
-datasets), 2) would typically only support 2D architectures and 3) conflict with our core design principle of carefully adapting 
-the network topology for each dataset (if the topology is changed one can no longer transfer pretrained weights!) 
+- dataset.json, plans.json, predict_from_raw_data_args.json as in nnU-Net
+- Multi-label segmentation .nii.gz for each case. Each landmark is represented by a label containing the top 27 voxels of the predicted heatmap.  
+- Prediction jsons for each case, containing voxel coordinates and a likelihood for each landmark.
 
-## What happened to the old nnU-Net?
-The core of the old nnU-Net was hacked together in a short time period while participating in the Medical Segmentation 
-Decathlon challenge in 2018. Consequently, code structure and quality were not the best. Many features 
-were added later on and didn't quite fit into the nnU-Net design principles. Overall quite messy, really. And annoying to work with.
 
-nnU-Net V2 is a complete overhaul. The "delete everything and start again" kind. So everything is better 
-(in the author's opinion haha). While the segmentation performance [remains the same](https://docs.google.com/spreadsheets/d/13gqjIKEMPFPyMMMwA1EML57IyoBjfC3-QCTn4zRN_Mg/edit?usp=sharing), a lot of cool stuff has been added. 
-It is now also much easier to use it as a development framework and to manually fine-tune its configuration to new 
-datasets. A big driver for the reimplementation was also the emergence of [Helmholtz Imaging](http://helmholtz-imaging.de), 
-prompting us to extend nnU-Net to more image formats and domains. Take a look [here](documentation/changelog.md) for some highlights.
+## Evaluation
 
-# Acknowledgements
+Use the custom nnLandmark evaluation script:
+
+```bash
+python nnunetv2/evaluation/nnLandmark/evaluate_prediction.py \
+    --nnUNet_raw /path/to/nnUNet_raw/ \
+    --dataset_name DATASET_ID \
+    --predictions /path/to/evaluation/DATASET_ID/predictions/
+```
+
+This script will create:
+
+- prediction_all_landmark_voxel.json: Predictions of all cases in voxel coordinates.
+- summary_voxel.py: Metrics in voxel
+- summary_mm.py: Metrics in mm
+
+### FeTA Biometry Measurement Evaluation
+
+To use the custom nnLandmark feta measurement evaluation script, the landmarks, which act as control points for the measurements, must comply to the following naming convention: "landmark_1_1", "landmark_1_2", "landmark_2_1" etc. The euclidean distance is then taken between the two pairs, "_1" and "_2" of each landmark_x.
+
+```bash
+python nnunetv2/evaluation/nnLandmark/evaluate_feta_measurements.py \
+    --nnUNet_raw /path/to/nnUNet_raw/ \
+    --dataset_name DATASET_ID \
+    --predictions /path/to/evaluation/DATASET_ID/predictions/
+```
+
+This script will create a measurements.py. 
+
+## Citation
+
+If you use this code in your research, please cite our paper:
+
+tbd.
+
+## Acknowledgements
 <img src="documentation/assets/HI_Logo.png" height="100px" />
 
 <img src="documentation/assets/dkfz_logo.png" height="100px" />
