@@ -1157,8 +1157,6 @@ class nnLandmark_trainer_base_edt7(nnLandmark_trainer_base):
 # ************************************************ Trainers for nnLandmark MIDL 2026 Paper ************************************************
 # *****************************************************************************************************************************************
 
-
-
 # Here now set back to original nnUNet DA
 class nnLandmark(nnLandmark_trainer_base):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -1167,8 +1165,17 @@ class nnLandmark(nnLandmark_trainer_base):
         self.blobb_radius = 15
         self.enable_deep_supervision = False
         self.blobb_type = 'EDT'
-        self.num_epochs=1
 
+        self.print_to_log_file(
+            "\n#######################################################################\n"
+            "Please cite the following paper when using nnLandmark:\n"
+            "Ertl, A., Denner, S., Peretzke, R., Xiao, S., Zimmerer, D., Fischer, M., Bujotzek, M., "
+            "Yang, X., Neher, P., Isensee, F., & Maier-Hein, K. H. (2026). "
+            "nnLandmark: A Self-Configuring Method for 3D Medical Landmark Detection. "
+            "arXiv:2504.06742. https://arxiv.org/abs/2504.06742\n"
+            "#######################################################################\n",
+            also_print_to_console=True, add_timestamp=False
+        )
 
     def get_training_transforms(
             self, patch_size: Union[np.ndarray, Tuple[int]],
