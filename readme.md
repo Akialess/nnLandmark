@@ -2,20 +2,21 @@
 
 This repository contains the implementation of nnLandmark, a self-configuring framework for 3D medical landmark detection.
 
-The repository you see here is a fork of [nnU-Net](https://github.com/MIC-DKFZ/nnUNet). Please head over there to read more about it.
-
 🚀 nnLandmark is accepted to MIDL 2026! 
 Find the preprind on arxiv: &nbsp; &nbsp;   [![arXiv](https://img.shields.io/badge/arXiv-2404.03010-B31B1B.svg)](https://arxiv.org/abs/2504.06742)
-
 
 Copyright German Cancer Research Center (DKFZ) and contributors. Please make sure that your usage of this code is in compliance with its license.
 
 ## Installation
+The repository you see here is a fork of [nnU-Net](https://github.com/MIC-DKFZ/nnUNet). Please head over there to read more about it.
+
 We strongly recommend installing this in a dedicated virtual environment (for example conda).
 We recommend using a Linux based operating system, for example Ubuntu. Windows should work as well but is not tested.
 
 Some dependencies should be installed manually:
-- Install pytorch according to the instructions on the [pytorch website](https://pytorch.org/get-started/locally/). We recommend version 2.8. Pick the correct CUDA version for your system, we used 12.8.
+- Install python, we used 3.13.
+- Install pytorch according to the instructions on the [pytorch website](https://pytorch.org/get-started/locally/). We recommend version 2.8. 
+- Pick the correct CUDA version for your system, we used 12.8.
 
 Now you can just clone this repository and install it:
 
@@ -28,14 +29,14 @@ pip install -e .
 ## Data Format
 
 ### Path setup
-We are using the same paths as nnU-Net, defined as environment variables pointing it to raw data, preprocessed data and results. Set them with
+We are using the same path system as nnU-Net, defined as environment variables pointing it to raw data, preprocessed data and results. Set them with
 
 ```
-export nnUNet_results=/home/isensee/nnUNet_results
-export nnUNet_preprocessed=/home/isensee/nnUNet_preprocessed
-export nnUNet_raw=/home/isensee/nnUNet_raw
+export nnLM_results=/home/isensee/nnLM_results
+export nnLM_preprocessed=/home/isensee/nnLM_preprocessed
+export nnLM_raw=/home/isensee/nnLM_raw
 ```
-Make sure at least `$nnUNet_preprocessed` (but ideally all of them) are on a fast storage such as a local SSD or very good network drive! 
+Make sure at least `$nnLM_preprocessed` (but ideally all of them) are on a fast storage such as a local SSD or very good network drive! 
 
 RECOMMENDED: Add these lines to your `.bashrc` file (or whatever you are using) so that the environment variables are set automatically. If you don't do this you need to export them every time you open a new terminal.
 
@@ -84,7 +85,7 @@ RECOMMENDED: Add these lines to your `.bashrc` file (or whatever you are using) 
 
 ### Public Dataset Conversion Scripts
 
-We provide dataset conversion scripts under nnunetv2/dataset_conversion/nnLandmark for the following public landmark detection datasets. The folder also contains all train/test splits of the datasets, either the official, published splits or, if not available, the custom split we created and used in the nnLandmark paper MIDL 2026.
+We provide dataset conversion scripts under nnlandmark/dataset_conversion/nnLandmark for the following public landmark detection datasets. The folder also contains all train/test splits of the datasets, either the official, published splits or, if not available, the custom split we created and used in the nnLandmark paper MIDL 2026.
 Please check the respective licenses of the datasets before using them!
 
 - AFIDs: https://github.com/afids/afids-data
@@ -99,7 +100,7 @@ Please check the respective licenses of the datasets before using them!
 We use the experiment planning and preprocessing functionality of nnU-Net as is. 
 
 ```bash
-nnUNetv2_plan_and_preprocess \
+nnLM_plan_and_preprocess \
      -d DATASET_ID \
      -c 3d_fullres \
      --verify_dataset_integrity
@@ -107,7 +108,7 @@ nnUNetv2_plan_and_preprocess \
 To add the experiment plans for using the ResEncM architecture, our recommendation for the best results, :
 
 ```bash
-nnUNetv2_plan_experiment \
+nnLM_plan_experiment \
     -d DATASET \
     -pl nnUNetPlannerResEncM
 ```
@@ -118,7 +119,7 @@ nnUNetv2_plan_experiment \
 Start a nnU-Net training with the nnLandmark trainer. For using the ResEncM architecture plans, add the respective flag:
 
 ```bash
-nnUNetv2_train \
+nnLM_train \
     DATASET_NAME_OR_ID \
     3d_fullres \
     FOLD \
@@ -129,15 +130,14 @@ nnUNetv2_train \
 
 ## Predictions
 
-Use the costum nnLandmark predict script to predict a raw image folder:
+Use the costum nnLandmark predict script to predict a raw image folder. For using the ResEncM architecture plans, add the respective flag:
 
 ```bash
-python nnunetv2/inference/nnLandmark/predict_from_raw_data.py \
+python nnlandmark/inference/nnLandmark/predict_from_raw_data.py \
     -i /path/to/nnUNet_raw/DATASET_ID/imagesTs/ \
     -o /path/to/evaluation/DATASET_ID/predictions/ \
     -d DATASET_ID \
     -c 3d_fullres\
-    -tr nnLandmark \
     -p nnUNetResEncUNetMPlans
 ```
 
@@ -153,9 +153,8 @@ This scrip will create:
 Use the custom nnLandmark evaluation script:
 
 ```bash
-python nnunetv2/evaluation/nnLandmark/evaluate_prediction.py \
-    --nnUNet_raw /path/to/nnUNet_raw/ \
-    --dataset_name DATASET_ID \
+python nnlandmark/evaluation/nnLandmark/evaluate_prediction.py \
+    --dataset DATASET_ID \
     --predictions /path/to/evaluation/DATASET_ID/predictions/
 ```
 
@@ -170,10 +169,10 @@ This script will create:
 To use the custom nnLandmark feta measurement evaluation script, the landmarks, which act as control points for the measurements, must comply to the following naming convention: "landmark_1_1", "landmark_1_2", "landmark_2_1" etc. The euclidean distance is then taken between the two pairs, "_1" and "_2" of each landmark_x.
 
 ```bash
-python nnunetv2/evaluation/nnLandmark/evaluate_feta_measurements.py \
-    --nnUNet_raw /path/to/nnUNet_raw/ \
-    --dataset_name DATASET_ID \
-    --predictions /path/to/evaluation/DATASET_ID/predictions/
+python nnlandmark/evaluation/nnLandmark/evaluate_feta_measurements.py \
+    --predictions /path/to/evaluation/Dataset742_FeTA_2_4/nnLandmark_trainer/prediction/prediction_all_landmark_voxel.json \
+    --ground_truth /path/to/nnunet_data/nnUNet_raw/Dataset742_FeTA_2_4/all_landmarks_voxel.json \
+    --spacing /path/to/nnunet_data/nnUNet_raw/Dataset742_FeTA_2_4/spacing.json. \
 ```
 
 This script will create a measurements.py. 
