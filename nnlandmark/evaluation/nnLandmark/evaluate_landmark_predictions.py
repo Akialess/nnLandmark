@@ -88,7 +88,8 @@ def evaluate_MRE(folder_with_pred_jsons: str, gt_json: str):
                      'prediction_all_landmark_voxel.json', 'prediction_all_landmark_mm.json', 'predict_from_raw_data_args.json', 'summary_mm_image_spacing.json', 'summary_mm_annotation_spacing.json', 'renamed_landmarks.json')
         and not i.endswith('_mm.json')]
 
-    name_label_dict = load_json(os.path.join(os.path.dirname(gt_json), 'name_to_label.json'))
+    dataset_json = load_json(os.path.join(os.path.dirname(gt_json), 'dataset.json'))
+    name_label_dict = {k: v for k, v in dataset_json['labels'].items() if k != 'background'}
     all_landmarks = name_label_dict.keys()
 
     gt = load_json(gt_json)
@@ -154,7 +155,8 @@ def evaluate_MRE_mm(folder_with_pred_jsons: str, gt_json: str, spacing_json: str
                      'prediction_all_landmark_voxel.json', 'prediction_all_landmark_mm.json', 'predict_from_raw_data_args.json', 'summary_mm_image_spacing.json', 'summary_mm_annotation_spacing.json', 'renamed_landmarks.json')
         and not i.endswith('_mm.json')]
 
-    name_label_dict = load_json(os.path.join(os.path.dirname(gt_json), 'name_to_label.json'))
+    dataset_json = load_json(os.path.join(os.path.dirname(gt_json), 'dataset.json'))
+    name_label_dict = {k: v for k, v in dataset_json['labels'].items() if k != 'background'}
     all_landmarks = name_label_dict.keys()
 
     gt = load_json(gt_json)
@@ -237,7 +239,8 @@ def evaluate_MRE_from_aggregated(folder_with_pred_jsons: str, gt_json: str):
     pred_voxel_by_case = load_json(aggregated_pred_path)
     gt = load_json(gt_json)
 
-    name_label_dict = load_json(os.path.join(os.path.dirname(gt_json), 'name_to_label.json'))
+    dataset_json = load_json(os.path.join(os.path.dirname(gt_json), 'dataset.json'))
+    name_label_dict = {k: v for k, v in dataset_json['labels'].items() if k != 'background'}
     all_landmarks = name_label_dict.keys()
 
     not_in_pred = [i for i in gt.keys() if i not in pred_voxel_by_case.keys()]
@@ -307,7 +310,8 @@ def evaluate_MRE_mm_from_aggregated(folder_with_pred_jsons: str, gt_json: str, s
     gt = load_json(gt_json)
     spacing_by_case = load_spacing_map(spacing_json)
 
-    name_label_dict = load_json(os.path.join(os.path.dirname(gt_json), 'name_to_label.json'))
+    dataset_json = load_json(os.path.join(os.path.dirname(gt_json), 'dataset.json'))
+    name_label_dict = {k: v for k, v in dataset_json['labels'].items() if k != 'background'}
     all_landmarks = name_label_dict.keys()
 
     not_in_pred = [i for i in gt.keys() if i not in pred_voxel_by_case.keys()]
@@ -394,11 +398,12 @@ def evaluate_entry_point():
     dataset_name = maybe_convert_to_dataset_name(args.d)
     dataset_root = Path(nnLandmark_raw) / dataset_name
 
-    # load jsons 
-    name_to_label_path = dataset_root / "name_to_label.json"
+    # load jsons
+    dataset_json_path = dataset_root / "dataset.json"
     spacing_json_path = dataset_root / "spacing.json"
 
-    n2l = load_json(name_to_label_path)
+    dataset_json = load_json(str(dataset_json_path))
+    n2l = {k: v for k, v in dataset_json['labels'].items() if k != 'background'}
     label_to_name = {str(v): k for k, v in n2l.items()}
 
     # aggregate voxel prediction

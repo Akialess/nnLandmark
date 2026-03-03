@@ -56,11 +56,7 @@ def main():
     (out_root / "spacing.json").write_text(
         json.dumps(out_spacing, indent=2)
     )
-    (out_root / "name_to_label.json").write_text(
-        json.dumps(name_to_label, indent=2)
-    )
-
-    print(f"✅  wrote landmarks ({len(cases)} cases), spacing and name_to_label JSONs to {out_root}")
+    print(f"✅  wrote landmarks ({len(cases)} cases) and spacing JSONs to {out_root}")
 
 
 if __name__ == "__main__":

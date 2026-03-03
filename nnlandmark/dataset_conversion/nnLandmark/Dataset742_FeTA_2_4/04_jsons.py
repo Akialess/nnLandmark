@@ -48,11 +48,7 @@ def main():
     (dataset_root / "spacing.json").write_text(
         json.dumps(out_spacing, indent=2)
     )
-    (dataset_root / "name_to_label.json").write_text(
-        json.dumps(name_to_label, indent=2)
-    )
-
-    print(f"✅  Wrote spacing and name_to_label JSONs to {dataset_root}")
+    print(f"✅  Wrote spacing JSON to {dataset_root}")
 
 
 if __name__ == "__main__":

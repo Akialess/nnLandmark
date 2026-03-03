@@ -268,8 +268,6 @@ def main():
     #(out_root / "all_landmarks_voxel_mirror_y.json").write_text(json.dumps(all_labels_voxel_my, indent=2))
     #(out_root / "all_landmarks_voxel_mirror_xy.json").write_text(json.dumps(all_labels_voxel_mxy, indent=2))
     (out_root / "spacing.json").write_text(json.dumps(spacing_map, indent=2))
-    (out_root / "name_to_label.json").write_text(json.dumps(name_to_label, indent=2))
-
     print("Wrote JSON outputs to", out_root)
 
 
