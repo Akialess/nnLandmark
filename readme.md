@@ -45,7 +45,7 @@ RECOMMENDED: Add these lines to your `.bashrc` file (or whatever you are using) 
 
 ### Additional JSONs
 
-- **dataset.json**: Follows the conventions of nnU-Net. The landmark locations are represented as multi-label segmentation map. Consequently each label corresponds to a specific landmark class. This must be consistent throught the entire dataset and experimentation and is defined in the dataset JSON.
+- **dataset.json**: Follows the conventions of nnU-Net. The landmark locations are represented as multi-label segmentation map. Consequently each label corresponds to a specific landmark class. This must be consistent throught the entire dataset and experimentation and is defined in the dataset JSON. The label names are accessed in the evaluation to map from the predicted labels to the landmark class.
 
 ```bash
 {
@@ -63,15 +63,6 @@ RECOMMENDED: Add these lines to your `.bashrc` file (or whatever you are using) 
     "numTraining": 110,
     "file_ending": ".nii.gz",
     "name": "Dataset732_Afids"
-}
-```
-
-- **name_to_label.json**: Contains all landmark class names as keys and the respective segmentation label values (starting from 1).
-
-```bash
-{
-  "landmark_1": 1,
-  "landmark_2": 2,
 }
 ```
 
