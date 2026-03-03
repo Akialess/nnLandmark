@@ -154,31 +154,18 @@ def main():
     dst = Path(args.dst).resolve()
     dst.mkdir(parents=True, exist_ok=True)
 
-    #tr_labels, tr_spacing, tr_names = collect_split_many_points(src / "train", src / "train_label")
-    #ts_labels, ts_spacing, ts_names = collect_split_many_points(src / "valid", src / "valid_label")
-    ts_labels, ts_spacing, ts_names = collect_split_many_points(src / "feta21", src / "feta21_label")
+    tr_labels, tr_spacing, tr_names = collect_split_many_points(src / "train", src / "train_label")
+    ts_labels, ts_spacing, ts_names = collect_split_many_points(src / "valid", src / "valid_label")
 
-    # Build contiguous name_to_label in enumerated order
-    #all_names_sorted = sorted(set(tr_names).union(ts_names),
-    all_names_sorted = sorted(ts_names,
-                              key=lambda s: (int(re.match(r"^landmark_(\d+)_(\d+)$", s).group(1)),
-                                             int(re.match(r"^landmark_(\d+)_(\d+)$", s).group(2)))
-                              if re.match(r"^landmark_(\d+)_(\d+)$", s) else (10**9, 10**9))
-    name_to_label: Dict[str, int] = {name: idx for idx, name in enumerate(all_names_sorted, start=1)}
+    all_labels = OrderedDict(**tr_labels, **ts_labels)
+    all_spacing = OrderedDict(**tr_spacing, **ts_spacing)
 
-    #(dst / "all_landmarks_voxel_train.json").write_text(json.dumps(tr_labels, indent=2))
-    #(dst / "all_landmarks_voxel_test.json").write_text(json.dumps(ts_labels, indent=2))
-    #(dst / "spacing_train.json").write_text(json.dumps(tr_spacing, indent=2))
-    (dst / "spacing_test.json").write_text(json.dumps(ts_spacing, indent=2))
-    (dst / "name_to_label.json").write_text(json.dumps(name_to_label, indent=2))
-    (dst / "all_landmarks_voxel_test.json").write_text(json.dumps(ts_labels, indent=2))
+    (dst / "all_landmarks_voxel.json").write_text(json.dumps(all_labels, indent=2))
+    (dst / "spacing.json").write_text(json.dumps(all_spacing, indent=2))
 
     print("Wrote:")
-    print("  all_landmarks_voxel_train.json")
-    print("  all_landmarks_voxel_test.json")
-    print("  spacing_train.json")
-    print("  spacing_test.json")
-    print("  name_to_label.json")
+    print("  all_landmarks_voxel.json")
+    print("  spacing.json")
 
 if __name__ == "__main__":
     main()

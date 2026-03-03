@@ -118,13 +118,9 @@ def main() -> None:
     (out_root / "spacing.json").write_text(
         json.dumps(all_spacing, indent=2)
     )
-    (out_root / "name_to_label.json").write_text(
-        json.dumps(name_to_label, indent=2)
-    )
     print("✅  Wrote:")
-    print("   • afids_all_landmarks.json")
-    print("   • afids_spacing.json")
-    print("   • afids_name_to_label.json")
+    print("   • all_landmarks_voxel.json")
+    print("   • spacing.json")
 
 
 if __name__ == "__main__":

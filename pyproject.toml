@@ -6,8 +6,8 @@ description = "nnLandmark is a self-configuring framerwork for 3D medical landma
 readme = "readme.md"
 license = { file = "LICENSE" }
 authors = [
-    { name = "Fabian Isensee", email = "f.isensee@dkfz-heidelberg.de"},
-    { name = "Helmholtz Imaging Applied Computer Vision Lab" }
+    { name = "Alexandra Ertl", email = "alexandra.ertl@dkfz-heidelberg.de"},
+    { name = "Division of Medical Image Computing, German Cancer Research Center (DKFZ), Heidelberg, Germany" }
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",

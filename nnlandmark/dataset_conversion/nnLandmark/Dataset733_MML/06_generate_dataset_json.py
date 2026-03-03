@@ -8,10 +8,14 @@ root = Path("/path/to/Project_nnLandmark/nnunet_data/nnUNet_raw/Dataset733_MML")
 imagesTr = root / "imagesTr"
 imagesTs = root / "imagesTs"
 
-# ------------------------------------------------------------------ load name→label and invert
-name2label_path = root / "name_to_label.json"          # produced earlier
-name2label      = json.loads(name2label_path.read_text())    # landmark_<n> → int
-labels = {"background": 0, **name2label} 
+# ------------------------------------------------------------------ derive name→label from landmarks
+all_landmarks = json.loads((root / "all_landmarks_voxel.json").read_text())
+name2label = {}
+for case_lms in all_landmarks.values():
+    for name in case_lms:
+        if name not in name2label:
+            name2label[name] = len(name2label) + 1
+labels = {"background": 0, **name2label}
 
 print(f"{len(labels)-1} foreground labels loaded")
 # e.g. {0:'background', 1:'landmark_1', 2:'landmark_2', …}

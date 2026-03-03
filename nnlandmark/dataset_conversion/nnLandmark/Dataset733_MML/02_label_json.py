@@ -104,9 +104,6 @@ def main():
                     label = len(name_to_label) + 1
                 name_to_label[name] = label
 
-    (out_root / "name_to_label.json").write_text(
-        json.dumps(name_to_label, indent=2))
-
     (out_root / "spacing.json").write_text(
         json.dumps(all_spacings, indent=2))
 
