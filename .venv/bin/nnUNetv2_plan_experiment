@@ -1,0 +1,8 @@
+#!/auto/home/users/a/g/agiansan/nnLandmark/.venv/bin/python3
+# -*- coding: utf-8 -*-
+import re
+import sys
+from nnunetv2.experiment_planning.plan_and_preprocess_entrypoints import plan_experiment_entry
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(plan_experiment_entry())

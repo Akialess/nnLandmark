@@ -7,6 +7,8 @@ from queue import Queue
 from threading import Thread
 from time import sleep
 from typing import Tuple, Union, List, Optional
+import csv
+import time
 
 import numpy as np
 import torch
@@ -35,6 +37,18 @@ from nnunetv2.utilities.json_export import recursive_fix_for_json_export
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
+
+
+def _timed_export_prediction_from_logits(*args, **kwargs):
+    start = time.time()
+    result = export_prediction_from_logits(*args, **kwargs)
+    return result, time.time() - start
+
+
+def _timed_convert_predicted_logits_to_segmentation_with_correct_shape(*args, **kwargs):
+    start = time.time()
+    result = convert_predicted_logits_to_segmentation_with_correct_shape(*args, **kwargs)
+    return result, time.time() - start
 
 
 class nnUNetPredictor(object):
@@ -227,6 +241,8 @@ class nnUNetPredictor(object):
             output_folder = os.path.dirname(output_folder_or_list_of_truncated_output_files[0])
         else:
             output_folder = None
+            
+        self.output_folder = output_folder
 
         ########################
         # let's store the input arguments so that its clear what was used to generate the prediction
@@ -356,9 +372,14 @@ class nnUNetPredictor(object):
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
         If 'ofile' is None, the result will be returned instead of written to a file
         """
+
+        inference_times = []
+        preprocessing_times = []
+
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
             worker_list = [i for i in export_pool._pool]
             r = []
+            export_data_ids = []
             for preprocessed in data_iterator:
                 data = preprocessed['data']
                 if isinstance(data, str):
@@ -368,13 +389,21 @@ class nnUNetPredictor(object):
 
                 ofile = preprocessed['ofile']
                 if ofile is not None:
+                    data_id = os.path.basename(ofile)
                     print(f'\nPredicting {os.path.basename(ofile)}:')
                 else:
+                    data_id = f'image_shape_{"x".join(str(s) for s in data.shape)}'
                     print(f'\nPredicting image of shape {data.shape}:')
 
                 print(f'perform_everything_on_device: {self.perform_everything_on_device}')
 
                 properties = preprocessed['data_properties']
+
+                # Collect preprocessing time
+                preprocess_time = preprocessed.get('preprocess_time', None)
+                if preprocess_time is not None:
+                    preprocessing_times.append((data_id, preprocess_time))
+                    print(f'Preprocessing time for {data_id}: {preprocess_time:.4f}s')
 
                 # let's not get into a runaway situation where the GPU predicts so fast that the disk has to be swamped with
                 # npy files
@@ -383,14 +412,29 @@ class nnUNetPredictor(object):
                     sleep(0.1)
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
 
+                # Compute inference time
+                if self.device.type == 'cuda' :
+                    torch.cuda.synchronize()  
+                else :
+                    None
+                start_time = time.time()
+
                 # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
                 prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                
+                if self.device.type == 'cuda' :
+                    torch.cuda.synchronize()  
+                else : 
+                    None
+                elapsed = time.time() - start_time
+                inference_times.append((data_id, elapsed))
+                print(f'Inference time for {data_id}: {elapsed:.4f}s')
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
                     r.append(
                         export_pool.starmap_async(
-                            export_prediction_from_logits,
+                            _timed_export_prediction_from_logits,
                             ((prediction, properties, self.configuration_manager, self.plans_manager,
                               self.dataset_json, ofile, save_probabilities),)
                         )
@@ -399,21 +443,88 @@ class nnUNetPredictor(object):
                     print('sending off prediction to background worker for resampling')
                     r.append(
                         export_pool.starmap_async(
-                            convert_predicted_logits_to_segmentation_with_correct_shape, (
+                            _timed_convert_predicted_logits_to_segmentation_with_correct_shape, (
                                 (prediction, self.plans_manager,
                                  self.configuration_manager, self.label_manager,
                                  properties,
                                  save_probabilities),)
                         )
                     )
+                export_data_ids.append(data_id)
                 if ofile is not None:
                     print(f'done with {os.path.basename(ofile)}')
                 else:
                     print(f'\nDone with image of shape {data.shape}:')
-            ret = [i.get()[0] for i in r]
+            ret = []
+            postprocessing_times = []
+            for async_result, data_id in zip(r, export_data_ids):
+                result, export_elapsed = async_result.get()[0]
+                ret.append(result)
+                postprocessing_times.append((data_id, export_elapsed))
+                print(f'Postprocessing time for {data_id}: {export_elapsed:.4f}s')
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
             data_iterator._finish()
+
+        # save inference times to CSV
+        if inference_times:
+            # determine output folder from the first ofile, or use current directory
+            first_ofile = inference_times[0][0]
+            csv_path = None
+            for preprocessed_item in []:
+                pass  # iterator exhausted, we use ret info instead
+            # try to find the output folder from ofile paths stored during iteration
+            # We saved data_id which is basename; reconstruct folder from last known ofile
+            # Use a simple fallback: write next to predictions
+            try:
+                # The ofile in the iterator was the truncated output filename;
+                # the actual folder is its parent directory
+                csv_dir = os.path.dirname(os.path.abspath(ofile)) if ofile is not None else os.getcwd()
+            except Exception:
+                csv_dir = os.getcwd()
+            
+            # If output_folder is available from the class state, use it instead
+            if hasattr(self, 'output_folder') and self.output_folder is not None:
+                csv_dir = self.output_folder
+                
+            csv_path = os.path.join(csv_dir, 'inference_times.csv')
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['data_id', 'inference_time_seconds'])
+                writer.writerows(inference_times)
+            print(f'\nInference times saved to {csv_path}')
+
+        # save preprocessing times to CSV
+        if preprocessing_times:
+            if hasattr(self, 'output_folder') and self.output_folder is not None:
+                pp_csv_dir = self.output_folder
+            else:
+                try:
+                    pp_csv_dir = os.path.dirname(os.path.abspath(ofile)) if ofile is not None else os.getcwd()
+                except Exception:
+                    pp_csv_dir = os.getcwd()
+            pp_csv_path = os.path.join(pp_csv_dir, 'preprocessing_times.csv')
+            with open(pp_csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['data_id', 'preprocessing_time_seconds'])
+                writer.writerows(preprocessing_times)
+            print(f'Preprocessing times saved to {pp_csv_path}')
+
+        # save postprocessing times to CSV
+        if postprocessing_times:
+            if hasattr(self, 'output_folder') and self.output_folder is not None:
+                post_csv_dir = self.output_folder
+            else:
+                try:
+                    post_csv_dir = os.path.dirname(os.path.abspath(ofile)) if ofile is not None else os.getcwd()
+                except Exception:
+                    post_csv_dir = os.getcwd()
+            post_csv_path = os.path.join(post_csv_dir, 'postprocessing_times.csv')
+            with open(post_csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['data_id', 'postprocessing_time_seconds'])
+                writer.writerows(postprocessing_times)
+            print(f'Postprocessing times saved to {post_csv_path}')
 
         # clear lru cache
         compute_gaussian.cache_clear()
