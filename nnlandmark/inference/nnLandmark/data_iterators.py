@@ -2,6 +2,7 @@ import multiprocessing
 import queue
 from torch.multiprocessing import Event, Queue, Manager
 
+import time
 from time import sleep
 from typing import Union, List
 
@@ -28,6 +29,7 @@ def preprocess_fromfiles_save_to_queue(list_of_lists: List[List[str]],
         label_manager = plans_manager.get_label_manager(dataset_json)
         preprocessor = configuration_manager.preprocessor_class(verbose=verbose)
         for idx in range(len(list_of_lists)):
+            preprocessed_start = time.time()
             data, seg, data_properties = preprocessor.run_case(list_of_lists[idx],
                                                                list_of_segs_from_prev_stage_files[
                                                                    idx] if list_of_segs_from_prev_stage_files is not None else None,
@@ -39,9 +41,11 @@ def preprocess_fromfiles_save_to_queue(list_of_lists: List[List[str]],
                 data = np.vstack((data, seg_onehot))
 
             data = torch.from_numpy(data).to(dtype=torch.float32, memory_format=torch.contiguous_format)
+            preprocess_time = time.time() - preprocessed_start
 
             item = {'data': data, 'data_properties': data_properties,
-                    'ofile': output_filenames_truncated[idx] if output_filenames_truncated is not None else None}
+                    'ofile': output_filenames_truncated[idx] if output_filenames_truncated is not None else None,
+                    'preprocess_time': preprocess_time}
             success = False
             while not success:
                 try:

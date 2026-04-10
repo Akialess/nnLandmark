@@ -81,7 +81,8 @@ def preprocessing_iterator_fromfiles(list_of_lists: List[List[str]],
     abort_event = manager.Event()
     for i in range(num_processes):
         event = manager.Event()
-        queue = Manager().Queue(maxsize=1)
+        # Increased maxsize from 1 to 2 for better pipeline buffering
+        q = manager.Queue(maxsize=2)
         pr = context.Process(target=preprocess_fromfiles_save_to_queue,
                      args=(
                          list_of_lists[i::num_processes],
@@ -92,19 +93,18 @@ def preprocessing_iterator_fromfiles(list_of_lists: List[List[str]],
                          plans_manager,
                          dataset_json,
                          configuration_manager,
-                         queue,
+                         q,
                          event,
                          abort_event,
                          verbose
                      ), daemon=True)
         pr.start()
-        target_queues.append(queue)
+        target_queues.append(q)
         done_events.append(event)
         processes.append(pr)
 
     worker_ctr = 0
     while (not done_events[worker_ctr].is_set()) or (not target_queues[worker_ctr].empty()):
-        # import IPython;IPython.embed()
         if not target_queues[worker_ctr].empty():
             item = target_queues[worker_ctr].get()
             worker_ctr = (worker_ctr + 1) % num_processes
@@ -117,8 +117,9 @@ def preprocessing_iterator_fromfiles(list_of_lists: List[List[str]],
                                    'workers or get more RAM in that case!')
             sleep(0.01)
             continue
-        if pin_memory:
-            [i.pin_memory() for i in item.values() if isinstance(i, torch.Tensor)]
+        # Fix: pin_memory() returns a new tensor, so we must assign it back
+        if pin_memory and 'data' in item and isinstance(item['data'], torch.Tensor):
+            item['data'] = item['data'].pin_memory()
         yield item
     [p.join() for p in processes]
 
@@ -278,7 +279,8 @@ def preprocessing_iterator_fromnpy(list_of_images: List[np.ndarray],
     abort_event = manager.Event()
     for i in range(num_processes):
         event = manager.Event()
-        queue = manager.Queue(maxsize=1)
+        # Increased maxsize from 1 to 2 for better pipeline buffering
+        q = manager.Queue(maxsize=2)
         pr = context.Process(target=preprocess_fromnpy_save_to_queue,
                      args=(
                          list_of_images[i::num_processes],
@@ -289,7 +291,7 @@ def preprocessing_iterator_fromnpy(list_of_images: List[np.ndarray],
                          plans_manager,
                          dataset_json,
                          configuration_manager,
-                         queue,
+                         q,
                          event,
                          abort_event,
                          verbose
@@ -297,7 +299,7 @@ def preprocessing_iterator_fromnpy(list_of_images: List[np.ndarray],
         pr.start()
         done_events.append(event)
         processes.append(pr)
-        target_queues.append(queue)
+        target_queues.append(q)
 
     worker_ctr = 0
     while (not done_events[worker_ctr].is_set()) or (not target_queues[worker_ctr].empty()):
@@ -313,7 +315,8 @@ def preprocessing_iterator_fromnpy(list_of_images: List[np.ndarray],
                                    'workers or get more RAM in that case!')
             sleep(0.01)
             continue
-        if pin_memory:
-            [i.pin_memory() for i in item.values() if isinstance(i, torch.Tensor)]
+        # Fix: pin_memory() returns a new tensor, so we must assign it back
+        if pin_memory and 'data' in item and isinstance(item['data'], torch.Tensor):
+            item['data'] = item['data'].pin_memory()
         yield item
     [p.join() for p in processes]

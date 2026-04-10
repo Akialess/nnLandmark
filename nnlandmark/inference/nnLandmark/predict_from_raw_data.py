@@ -21,6 +21,9 @@ from torch._dynamo import OptimizedModule
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+
 import nnlandmark
 from nnlandmark.configuration import default_num_processes
 from nnlandmark.inference.nnLandmark.data_iterators import PreprocessAdapterFromNpy, preprocessing_iterator_fromfiles, \
@@ -55,7 +58,7 @@ class nnUNetPredictor(object):
     def __init__(self,
                  tile_step_size: float = 0.5,
                  use_gaussian: bool = True,
-                 use_mirroring: bool = True,
+                 use_mirroring: bool = False,
                  perform_everything_on_device: bool = True,
                  device: torch.device = torch.device('cuda'),
                  verbose: bool = False,
@@ -70,9 +73,9 @@ class nnUNetPredictor(object):
 
         self.tile_step_size = tile_step_size
         self.use_gaussian = use_gaussian
-        self.use_mirroring = use_mirroring
+        self.use_mirroring = False
         if device.type == 'cuda':
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.benchmark = True # A changer avec True si plusieurs images à prédire
         else:
             print(f'perform_everything_on_device=True is only supported for cuda devices! Setting this to False')
             perform_everything_on_device = False
@@ -81,10 +84,14 @@ class nnUNetPredictor(object):
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
-                                             checkpoint_name: str = 'checkpoint_final.pth'):
+                                             checkpoint_name: str = 'checkpoint_final.pth',
+                                             skip_network: bool = False):
         """
-        This is used when making predictions with a trained model
+        This is used when making predictions with a trained model.
+        Set skip_network=True when using an external inference engine (ONNX/TensorRT)
+        to skip loading PyTorch weights and building the network architecture.
         """
+        model_loading_start = time.time()
         if use_folds is None:
             use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
 
@@ -95,53 +102,75 @@ class nnUNetPredictor(object):
         if isinstance(use_folds, str):
             use_folds = [use_folds]
 
-        parameters = []
-        for i, f in enumerate(use_folds):
-            f = int(f) if f != 'all' else f
-            checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
-                                    map_location=torch.device('cpu'), weights_only=False)
-            if i == 0:
-                trainer_name = checkpoint['trainer_name']
-                configuration_name = checkpoint['init_args']['configuration']
-                inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
-                    'inference_allowed_mirroring_axes' in checkpoint.keys() else None
+        if skip_network:
+            weights_loading_time = time.time()
 
-            parameters.append(checkpoint['network_weights'])
+            folder_basename = os.path.basename(model_training_output_dir.rstrip('/'))
+            parts = folder_basename.split('__')
+            trainer_name = parts[0]
+            configuration_name = parts[2] if len(parts) >= 3 else parts[-1]
+            inference_allowed_mirroring_axes = None
+            parameters = [{}] * len(use_folds)
+
+            self.weights_loading_time = time.time() - weights_loading_time
+            print(f"Model weight loading skipped (skip_network=True) {self.weights_loading_time}s")
+        else:
+            parameters = []
+            weights_loading_time = time.time()
+            for i, f in enumerate(use_folds):
+                f = int(f) if f != 'all' else f
+                checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
+                                        map_location=torch.device('cpu'), weights_only=False)
+                if i == 0:
+                    trainer_name = checkpoint['trainer_name']
+                    configuration_name = checkpoint['init_args']['configuration']
+                    inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
+                        'inference_allowed_mirroring_axes' in checkpoint.keys() else None
+
+                parameters.append(checkpoint['network_weights'])
+
+            self.weights_loading_time = time.time() - weights_loading_time
+            print(f"Model weight loading {self.weights_loading_time}s")
 
         configuration_manager = plans_manager.get_configuration(configuration_name)
-        # restore network
-        num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
-        trainer_class = recursive_find_python_class(join(nnlandmark.__path__[0], "training", "nnUNetTrainer"),
-                                                    trainer_name, 'nnlandmark.training.nnUNetTrainer')
-        if trainer_class is None:
-            raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnlandmark.training.nnUNetTrainer. '
-                               f'Please place it there (in any .py file)!')
-        network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
-            num_input_channels,
-            plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
-        )
 
         self.plans_manager = plans_manager
         self.configuration_manager = configuration_manager
         self.list_of_parameters = parameters
 
-        # initialize network with first set of parameters, also see https://github.com/MIC-DKFZ/nnUNet/issues/2520
-        network.load_state_dict(parameters[0])
+        if not skip_network:
+            # restore network
+            num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
+            trainer_class = recursive_find_python_class(join(nnlandmark.__path__[0], "training", "nnUNetTrainer"),
+                                                        trainer_name, 'nnlandmark.training.nnUNetTrainer')
+            if trainer_class is None:
+                raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnlandmark.training.nnUNetTrainer. '
+                                   f'Please place it there (in any .py file)!')
+            network = trainer_class.build_network_architecture(
+                configuration_manager.network_arch_class_name,
+                configuration_manager.network_arch_init_kwargs,
+                configuration_manager.network_arch_init_kwargs_req_import,
+                num_input_channels,
+                plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
+                enable_deep_supervision=False
+            )
 
-        self.network = network
+            # initialize network with first set of parameters, also see https://github.com/MIC-DKFZ/nnUNet/issues/2520
+            network.load_state_dict(parameters[0])
+            self.network = network
+
+            if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
+                    and not isinstance(self.network, OptimizedModule):
+                print('Using torch.compile')
+                self.network = torch.compile(self.network)
 
         self.dataset_json = dataset_json
         self.trainer_name = trainer_name
         self.allowed_mirroring_axes = inference_allowed_mirroring_axes
         self.label_manager = plans_manager.get_label_manager(dataset_json)
-        if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
-                and not isinstance(self.network, OptimizedModule):
-            print('Using torch.compile')
-            self.network = torch.compile(self.network)
+
+        self.model_loading_time = time.time() - model_loading_start
+        print(f"Model loading {self.model_loading_time}s")
 
     def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
                               configuration_manager: ConfigurationManager, parameters: Optional[List[dict]],
@@ -233,6 +262,9 @@ class nnUNetPredictor(object):
         This is nnU-Net's default function for making predictions. It works best for batch predictions
         (predicting many images at once).
         """
+        # Time the file setup phase (everything before creating data iterator)
+        file_setup_start = time.time()
+        
         assert part_id <= num_parts, ("Part ID must be smaller than num_parts. Remember that we start counting with 0. "
                                       "So if there are 3 parts then valid part IDs are 0, 1, 2")
         if isinstance(output_folder_or_list_of_truncated_output_files, str):
@@ -276,12 +308,16 @@ class nnUNetPredictor(object):
                                                 save_probabilities)
         if len(list_of_lists_or_source_folder) == 0:
             return
-
+        
+        self.file_setup_time = time.time() - file_setup_start
+        
+        data_pre = time.time()
         data_iterator = self._internal_get_data_iterator_from_lists_of_filenames(list_of_lists_or_source_folder,
                                                                                  seg_from_prev_stage_files,
                                                                                  output_filename_truncated,
                                                                                  num_processes_preprocessing)
-
+        self.data_iterator_setup_time = time.time() - data_pre
+        print(f"data preprocessing total : {self.data_iterator_setup_time}s", flush=True)
         return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
 
     def _internal_get_data_iterator_from_lists_of_filenames(self,
@@ -372,15 +408,25 @@ class nnUNetPredictor(object):
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
         If 'ofile' is None, the result will be returned instead of written to a file
         """
+        total_predict_start = time.time()
+        main_thread_inference_times = []
+        background_preprocessing_times = []
+        main_thread_wait_for_preprocessing_times = []
+        main_thread_wait_for_export_pool_times = []
 
-        inference_times = []
-        preprocessing_times = []
-
+        pool_creation_start = time.time()
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
+            pool_creation_time = time.time() - pool_creation_start
+            print(f'pool_creation_time_seconds: {pool_creation_time:.4f}s')
+            
             worker_list = [i for i in export_pool._pool]
             r = []
             export_data_ids = []
+            
+            queue_wait_start = time.time()
             for preprocessed in data_iterator:
+                queue_wait_elapsed = time.time() - queue_wait_start
+                
                 data = preprocessed['data']
                 if isinstance(data, str):
                     delfile = data
@@ -395,22 +441,29 @@ class nnUNetPredictor(object):
                     data_id = f'image_shape_{"x".join(str(s) for s in data.shape)}'
                     print(f'\nPredicting image of shape {data.shape}:')
 
+                main_thread_wait_for_preprocessing_times.append((data_id, queue_wait_elapsed))
+                print(f'main_thread_wait_for_preprocessing_seconds for {data_id}: {queue_wait_elapsed:.4f}s')
+
                 print(f'perform_everything_on_device: {self.perform_everything_on_device}')
 
                 properties = preprocessed['data_properties']
 
-                # Collect preprocessing time
+                # Collect background preprocessing time
                 preprocess_time = preprocessed.get('preprocess_time', None)
                 if preprocess_time is not None:
-                    preprocessing_times.append((data_id, preprocess_time))
-                    print(f'Preprocessing time for {data_id}: {preprocess_time:.4f}s')
+                    background_preprocessing_times.append((data_id, preprocess_time))
+                    print(f'background_preprocessing_time_seconds for {data_id}: {preprocess_time:.4f}s')
 
                 # let's not get into a runaway situation where the GPU predicts so fast that the disk has to be swamped with
                 # npy files
+                export_pool_wait_start = time.time()
                 proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
                 while not proceed:
                     sleep(0.1)
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
+                export_pool_wait_elapsed = time.time() - export_pool_wait_start
+                main_thread_wait_for_export_pool_times.append((data_id, export_pool_wait_elapsed))
+                print(f'main_thread_wait_for_export_pool_seconds for {data_id}: {export_pool_wait_elapsed:.4f}s')
 
                 # Compute inference time
                 if self.device.type == 'cuda' :
@@ -427,8 +480,8 @@ class nnUNetPredictor(object):
                 else : 
                     None
                 elapsed = time.time() - start_time
-                inference_times.append((data_id, elapsed))
-                print(f'Inference time for {data_id}: {elapsed:.4f}s')
+                main_thread_inference_times.append((data_id, elapsed))
+                print(f'main_thread_inference_time_seconds for {data_id}: {elapsed:.4f}s')
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
@@ -455,81 +508,120 @@ class nnUNetPredictor(object):
                     print(f'done with {os.path.basename(ofile)}')
                 else:
                     print(f'\nDone with image of shape {data.shape}:')
+                
+                queue_wait_start = time.time()
+            
             ret = []
-            postprocessing_times = []
+            background_postprocessing_times = []
+            main_thread_wait_for_postprocessing_times = []
             for async_result, data_id in zip(r, export_data_ids):
+                postprocessing_wait_start = time.time()
                 result, export_elapsed = async_result.get()[0]
+                postprocessing_wait_elapsed = time.time() - postprocessing_wait_start
+                main_thread_wait_for_postprocessing_times.append((data_id, postprocessing_wait_elapsed))
+                print(f'main_thread_wait_for_postprocessing_seconds for {data_id}: {postprocessing_wait_elapsed:.4f}s')
+
                 ret.append(result)
-                postprocessing_times.append((data_id, export_elapsed))
-                print(f'Postprocessing time for {data_id}: {export_elapsed:.4f}s')
+                background_postprocessing_times.append((data_id, export_elapsed))
+                print(f'background_postprocessing_time_seconds for {data_id}: {export_elapsed:.4f}s')
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
             data_iterator._finish()
 
-        # save inference times to CSV
-        if inference_times:
-            # determine output folder from the first ofile, or use current directory
-            first_ofile = inference_times[0][0]
-            csv_path = None
-            for preprocessed_item in []:
-                pass  # iterator exhausted, we use ret info instead
-            # try to find the output folder from ofile paths stored during iteration
-            # We saved data_id which is basename; reconstruct folder from last known ofile
-            # Use a simple fallback: write next to predictions
-            try:
-                # The ofile in the iterator was the truncated output filename;
-                # the actual folder is its parent directory
-                csv_dir = os.path.dirname(os.path.abspath(ofile)) if ofile is not None else os.getcwd()
-            except Exception:
-                csv_dir = os.getcwd()
-            
-            # If output_folder is available from the class state, use it instead
+        # save times to a single CSV
+        if main_thread_inference_times or background_preprocessing_times or background_postprocessing_times:
             if hasattr(self, 'output_folder') and self.output_folder is not None:
                 csv_dir = self.output_folder
+            else:
+                try:
+                    csv_dir = os.path.dirname(os.path.abspath(ofile)) if ofile is not None else os.getcwd()
+                except Exception:
+                    csv_dir = os.getcwd()
+            
+            times_dict = {}
+            for data_id, t in background_preprocessing_times:
+                times_dict.setdefault(data_id, {})['background_preprocessing_time_seconds'] = t
+            for data_id, t in main_thread_inference_times:
+                times_dict.setdefault(data_id, {})['main_thread_inference_time_seconds'] = t
+            for data_id, t in background_postprocessing_times:
+                times_dict.setdefault(data_id, {})['background_postprocessing_time_seconds'] = t
+            for data_id, t in main_thread_wait_for_preprocessing_times:
+                times_dict.setdefault(data_id, {})['main_thread_wait_for_preprocessing_seconds'] = t
+            for data_id, t in main_thread_wait_for_export_pool_times:
+                times_dict.setdefault(data_id, {})['main_thread_wait_for_export_pool_seconds'] = t
+            for data_id, t in main_thread_wait_for_postprocessing_times:
+                times_dict.setdefault(data_id, {})['main_thread_wait_for_postprocessing_seconds'] = t
                 
-            csv_path = os.path.join(csv_dir, 'inference_times.csv')
-            with open(csv_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['data_id', 'inference_time_seconds'])
-                writer.writerows(inference_times)
-            print(f'\nInference times saved to {csv_path}')
+            # Compute total time if script_start_time was set
+            total_time = time.time() - self.script_start_time if hasattr(self, 'script_start_time') else ''
 
-        # save preprocessing times to CSV
-        if preprocessing_times:
-            if hasattr(self, 'output_folder') and self.output_folder is not None:
-                pp_csv_dir = self.output_folder
-            else:
-                try:
-                    pp_csv_dir = os.path.dirname(os.path.abspath(ofile)) if ofile is not None else os.getcwd()
-                except Exception:
-                    pp_csv_dir = os.getcwd()
-            pp_csv_path = os.path.join(pp_csv_dir, 'preprocessing_times.csv')
-            with open(pp_csv_path, 'w', newline='') as f:
+            csv_path = os.path.join(csv_dir, 'pipeline_times.csv')
+            file_exists = os.path.isfile(csv_path)
+            with open(csv_path, 'a', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['data_id', 'preprocessing_time_seconds'])
-                writer.writerows(preprocessing_times)
-            print(f'Preprocessing times saved to {pp_csv_path}')
-
-        # save postprocessing times to CSV
-        if postprocessing_times:
-            if hasattr(self, 'output_folder') and self.output_folder is not None:
-                post_csv_dir = self.output_folder
-            else:
-                try:
-                    post_csv_dir = os.path.dirname(os.path.abspath(ofile)) if ofile is not None else os.getcwd()
-                except Exception:
-                    post_csv_dir = os.getcwd()
-            post_csv_path = os.path.join(post_csv_dir, 'postprocessing_times.csv')
-            with open(post_csv_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['data_id', 'postprocessing_time_seconds'])
-                writer.writerows(postprocessing_times)
-            print(f'Postprocessing times saved to {post_csv_path}')
+                if not file_exists:
+                    writer.writerow(['data_id', 'wrapper_loading_time_seconds', 'file_setup_time_seconds',
+                                     'data_iterator_setup_time_seconds', 'pool_creation_time_seconds', 'model_loading_time_seconds',
+                                     'weights_loading_time_seconds', 'main_thread_wait_for_preprocessing_seconds',
+                                     'background_preprocessing_time_seconds', 'main_thread_wait_for_export_pool_seconds',
+                                     'main_thread_inference_time_seconds', 'main_thread_wait_for_postprocessing_seconds', 'background_postprocessing_time_seconds',
+                                     'unaccounted_main_thread_time_seconds', 'total_time_seconds'])
+                for data_id, t_dict in times_dict.items():
+                    wrapper_time = getattr(self, 'wrapper_loading_time', 0.0)
+                    file_setup_time = getattr(self, 'file_setup_time', 0.0)
+                    data_iterator_setup_time = getattr(self, 'data_iterator_setup_time', 0.0)
+                    model_time = getattr(self, 'model_loading_time', 0.0)
+                    weights_time = getattr(self, 'weights_loading_time', 0.0)
+                    
+                    # Convert to float to handle empty strings or missing values gracefully
+                    wrapper_v = float(wrapper_time) if wrapper_time else 0.0
+                    fs_v = float(file_setup_time) if file_setup_time else 0.0
+                    dis_v = float(data_iterator_setup_time) if data_iterator_setup_time else 0.0
+                    model_v = float(model_time) if model_time else 0.0
+                    weights_v = float(weights_time) if weights_time else 0.0
+                    
+                    wait_prep_v = float(t_dict.get('main_thread_wait_for_preprocessing_seconds', 0.0))
+                    wait_pool_v = float(t_dict.get('main_thread_wait_for_export_pool_seconds', 0.0))
+                    inf_v = float(t_dict.get('main_thread_inference_time_seconds', 0.0))
+                    wait_post_v = float(t_dict.get('main_thread_wait_for_postprocessing_seconds', 0.0))
+                    
+                    if type(total_time) in (float, int):
+                        # Calculate unaccounted string using the MAIN THREAD actions explicitly. 
+                        # Background processes run parallel to the main thread waiting, so we only sum the wait times and inference.
+                        calc_time = (wrapper_v + fs_v + dis_v + pool_creation_time + model_v + weights_v + wait_prep_v + wait_pool_v + inf_v + wait_post_v)
+                        unaccounted_time = total_time - calc_time
+                    else:
+                        unaccounted_time = ''
+                        
+                    writer.writerow([
+                        data_id,
+                        wrapper_time if wrapper_time else '',
+                        file_setup_time if file_setup_time else '',
+                        data_iterator_setup_time if data_iterator_setup_time else '',
+                        pool_creation_time,
+                        model_time if model_time else '',
+                        weights_time if weights_time else '',
+                        t_dict.get('main_thread_wait_for_preprocessing_seconds', ''),
+                        t_dict.get('background_preprocessing_time_seconds', ''),
+                        t_dict.get('main_thread_wait_for_export_pool_seconds', ''),
+                        t_dict.get('main_thread_inference_time_seconds', ''),
+                        t_dict.get('main_thread_wait_for_postprocessing_seconds', ''),
+                        t_dict.get('background_postprocessing_time_seconds', ''),
+                        unaccounted_time,
+                        total_time
+                    ])
+            print(f'\nPipeline times saved to {csv_path}')
 
         # clear lru cache
         compute_gaussian.cache_clear()
         # clear device cache
         empty_cache(self.device)
+        
+        if hasattr(self, 'script_start_time'):
+            total_predict_end = time.time() - self.script_start_time
+        else:
+            total_predict_end = time.time() - total_predict_start
+        print(f"total predict time : {total_predict_end}", flush=True)
         return ret
 
     def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
@@ -886,6 +978,7 @@ def _getDefaultValue(env: str, dtype: type, default: any,) -> any:
     return val
 
 def predict_entry_point_modelfolder():
+    script_start_time = time.time()
     import argparse
     parser = argparse.ArgumentParser(description='Use this to run inference with nnU-Net. This function is used when '
                                                  'you want to manually specify a folder containing a trained nnU-Net '
@@ -970,6 +1063,7 @@ def predict_entry_point_modelfolder():
                                 verbose=args.verbose,
                                 allow_tqdm=not args.disable_progress_bar,
                                 verbose_preprocessing=args.verbose)
+    predictor.script_start_time = script_start_time
     predictor.initialize_from_trained_model_folder(args.m, args.f, args.chk)
     predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
                                  overwrite=not args.continue_prediction,
@@ -980,6 +1074,7 @@ def predict_entry_point_modelfolder():
 
 
 def predict_entry_point():
+    script_start_time = time.time()
     import argparse
     parser = argparse.ArgumentParser(description='Use this to run inference with nnU-Net. This function is used when '
                                                  'you want to manually specify a folder containing a trained nnU-Net '
@@ -1090,6 +1185,7 @@ def predict_entry_point():
                                 verbose=args.verbose,
                                 verbose_preprocessing=args.verbose,
                                 allow_tqdm=not args.disable_progress_bar)
+    predictor.script_start_time = script_start_time
     predictor.initialize_from_trained_model_folder(
         model_folder,
         args.f,
@@ -1106,7 +1202,6 @@ def predict_entry_point():
                                                 folder_with_segs_from_prev_stage=args.prev_stage_predictions)
     
     else:
-        
         predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
                                     overwrite=not args.continue_prediction,
                                     num_processes_preprocessing=args.npp,

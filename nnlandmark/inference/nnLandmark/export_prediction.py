@@ -58,10 +58,11 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
     if isinstance(predicted_logits, np.ndarray):
             predicted_logits = torch.from_numpy(predicted_logits)
     predicted_probabilities = torch.sigmoid(predicted_logits)
-    segmentation = convert_probabilities_to_segmentation(predicted_probabilities)
+    #segmentation = convert_probabilities_to_segmentation(predicted_probabilities)
     del predicted_logits
 
     # put segmentation in bbox (revert cropping)
+    """
     segmentation_reverted_cropping = np.zeros(properties_dict['shape_before_cropping'],
                                               dtype=np.uint8 if len(label_manager.foreground_labels) < 255 else np.uint16)
     segmentation_reverted_cropping = insert_crop_into_image(segmentation_reverted_cropping, segmentation, properties_dict['bbox_used_for_cropping'])
@@ -73,6 +74,7 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
 
     # revert transpose
     segmentation_reverted_cropping = segmentation_reverted_cropping.transpose(plans_manager.transpose_backward)
+    """
 
     # revert cropping
     predicted_probabilities = label_manager.revert_cropping_on_probabilities(predicted_probabilities,
@@ -86,7 +88,8 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
                                                                         plans_manager.transpose_backward])
     torch.set_num_threads(old_threads)
 
-    return segmentation_reverted_cropping, predicted_probabilities
+    #return segmentation_reverted_cropping, predicted_probabilities
+    return predicted_probabilities
 
 # ──────────────────────────────────────────────────────────────────────────────
 #    returns (coord_tuple_or_None, likelihood)
@@ -145,42 +148,55 @@ def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, tor
 
     label_manager = plans_manager.get_label_manager(dataset_json_dict_or_file)
 
-    # Convert & resample back to original geometry
-    segmentation_final, probabilities_final = convert_predicted_logits_to_segmentation_with_correct_shape(
-        predicted_array_or_file, plans_manager, configuration_manager, label_manager, properties_dict,
-        return_probabilities=save_probabilities, num_threads_torch=num_threads_torch
-    )
-    del predicted_array_or_file
+    probs = predicted_array_or_file
+    if isinstance(probs, np.ndarray):
+        probs = torch.from_numpy(probs)
+    probs = torch.sigmoid(probs).cpu().numpy()
 
-    # ── save multi-label segmentation (nnU-Net writer handles header/affine etc.)
-    rw = plans_manager.image_reader_writer_class()
-    rw.write_seg(segmentation_final, output_file_truncated + dataset_json_dict_or_file['file_ending'],
-                 properties_dict)
-
-    # ── build flat per-class JSON (keys "1","2",..., no case wrapper), incl. likelihood
-    probs = probabilities_final
-    if isinstance(probs, torch.Tensor):
-        probs = probs.detach().cpu().numpy()
-
-    # Ensure shape (C, Z, Y, X)
-    if probs.ndim == 3:  # (C, Y, X) -> (C, 1, Y, X)
+     # Ensure shape (C, Z, Y, X)
+    if probs.ndim == 3: # (C, Y, X) -> (C, 1, Y, X)
         probs = probs[:, None, ...]
 
     # Foreground labels are the class ids (usually 1..C)
     class_ids = list(label_manager.foreground_labels)
+    shape_pred = probs.shape[1:] # (Z, Y, X)
+    shape_after_crop = properties_dict['shape_after_cropping_and_before_resampling']
+    bbox = properties_dict['bbox_used_for_cropping']
+    transpose_backward = plans_manager.transpose_backward
 
     out_json = {}
     for ch, cls_id in enumerate(class_ids):
-        coord, lik = _extract_landmark_coord_and_likelihood(probs[ch])  # returns (x,y,z), float
-        if coord is None:
+        coord_pred, lik = _extract_landmark_coord_and_likelihood(probs[ch])
+        
+        if coord_pred is None:
             out_json[str(int(cls_id))] = {
                 "coordinates": [None, None, None],
                 "likelihood": 0.0
             }
         else:
-            x, y, z = coord
+            cx_pred, cy_pred, cz_pred = coord_pred
+            
+            # Cropped coordinates, revert the resampling by scaling up
+            coord_crop_z = cz_pred * (shape_after_crop[0] / shape_pred[0])
+            coord_crop_y = cy_pred * (shape_after_crop[1] / shape_pred[1])
+            coord_crop_x = cx_pred * (shape_after_crop[2] / shape_pred[2])
+            
+            # Revert cropping by adding the bounding box offsets
+            coord_trans_z = coord_crop_z + bbox[0][0]
+            coord_trans_y = coord_crop_y + bbox[1][0]
+            coord_trans_x = coord_crop_x + bbox[2][0]
+            
+            coord_trans = [coord_trans_z, coord_trans_y, coord_trans_x]
+            
+            # Revert transposition
+            coord_orig = [0, 0, 0]
+            for i in range(3):
+                coord_orig[i] = coord_trans[transpose_backward[i]]
+                
+            z_orig, y_orig, x_orig = coord_orig
+            
             out_json[str(int(cls_id))] = {
-                "coordinates": [int(x), int(y), int(z)],
+                "coordinates": [int(round(x_orig)), int(round(y_orig)), int(round(z_orig))],
                 "likelihood": float(lik)
             }
 
