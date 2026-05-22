@@ -44,14 +44,80 @@ from nnlandmark.utilities.utils import create_lists_from_splitted_dataset_folder
 
 def _timed_export_prediction_from_logits(*args, **kwargs):
     start = time.time()
-    result = export_prediction_from_logits(*args, **kwargs)
-    return result, time.time() - start
+    times = export_prediction_from_logits(*args, **kwargs)
+    return times, time.time() - start
 
 
 def _timed_convert_predicted_logits_to_segmentation_with_correct_shape(*args, **kwargs):
     start = time.time()
-    result = convert_predicted_logits_to_segmentation_with_correct_shape(*args, **kwargs)
-    return result, time.time() - start
+    _, _, times = convert_predicted_logits_to_segmentation_with_correct_shape(*args, **kwargs)
+    return times, time.time() - start
+
+
+def _run_postprocessing_on_folder(input_folder: str, output_folder: str):
+    """Run vertebra postprocessing on all prediction JSONs in output_folder.
+
+    For each .json file, looks up the corresponding NIfTI image in input_folder
+    to extract voxel spacing, then applies the Dijkstra-based postprocessing.
+    """
+    import glob
+    try:
+        # Import from the code directory (same level as predict scripts)
+        code_dir = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                                '..', '..', '..', '..', 
+                                                'tfe_identification_vertebres',
+                                                'nnLandmark', 'code'))
+        if code_dir not in sys.path:
+            sys.path.insert(0, code_dir)
+        from vertebra_postprocessing import postprocess_json_file
+    except ImportError:
+        print("[WARN] vertebra_postprocessing module not found — skipping postprocessing.")
+        return
+
+    try:
+        import nibabel as nib
+    except ImportError:
+        print("[WARN] nibabel not available — skipping postprocessing.")
+        return
+
+    json_files = sorted(glob.glob(os.path.join(output_folder, "*.json")))
+    # Filter out non-prediction JSONs
+    json_files = [f for f in json_files if os.path.basename(f) not in
+                  ('dataset.json', 'plans.json', 'predict_from_raw_data_args.json')]
+
+    # When predicting clinical data sequentially, output_folder has ALL previous predictions.
+    # Filter them to only post-process those whose NIfTI file sits in the `input_folder` right now!
+    valid_json_files = []
+    for json_path in json_files:
+        case_id = os.path.splitext(os.path.basename(json_path))[0]
+        nifti_path = None
+        for suffix in ['_0000.nii.gz', '.nii.gz']:
+            candidate = os.path.join(input_folder, f"{case_id}{suffix}")
+            if os.path.isfile(candidate):
+                nifti_path = candidate
+                break
+        
+        if nifti_path is not None:
+            valid_json_files.append((json_path, case_id, nifti_path))
+
+    if not valid_json_files:
+        print("[WARN] No prediction JSONs linked to the current input folder found for postprocessing.")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"Running vertebra postprocessing on {len(valid_json_files)} predictions...")
+    print(f"{'='*60}")
+
+    for json_path, case_id, nifti_path in valid_json_files:
+        img = nib.load(nifti_path)
+        spacing = list(img.header.get_zooms()[:3])
+
+        print(f"\n  Postprocessing {case_id} (spacing={[round(s,2) for s in spacing]})...")
+        postprocess_json_file(json_path, spacing)
+
+    print(f"\n{'='*60}")
+    print(f"Postprocessing complete.")
+    print(f"{'='*60}")
 
 
 class nnUNetPredictor(object):
@@ -63,10 +129,12 @@ class nnUNetPredictor(object):
                  device: torch.device = torch.device('cuda'),
                  verbose: bool = False,
                  verbose_preprocessing: bool = False,
+                 spine_process: bool = False,
                  allow_tqdm: bool = True):
         self.verbose = verbose
         self.verbose_preprocessing = verbose_preprocessing
         self.allow_tqdm = allow_tqdm
+        self.spine_process = spine_process
 
         self.plans_manager, self.configuration_manager, self.list_of_parameters, self.network, self.dataset_json, \
         self.trainer_name, self.allowed_mirroring_axes, self.label_manager = None, None, None, None, None, None, None, None
@@ -91,7 +159,6 @@ class nnUNetPredictor(object):
         Set skip_network=True when using an external inference engine (ONNX/TensorRT)
         to skip loading PyTorch weights and building the network architecture.
         """
-        model_loading_start = time.time()
         if use_folds is None:
             use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
 
@@ -111,9 +178,6 @@ class nnUNetPredictor(object):
             configuration_name = parts[2] if len(parts) >= 3 else parts[-1]
             inference_allowed_mirroring_axes = None
             parameters = [{}] * len(use_folds)
-
-            self.weights_loading_time = time.time() - weights_loading_time
-            print(f"Model weight loading skipped (skip_network=True) {self.weights_loading_time}s")
         else:
             parameters = []
             weights_loading_time = time.time()
@@ -129,8 +193,10 @@ class nnUNetPredictor(object):
 
                 parameters.append(checkpoint['network_weights'])
 
-            self.weights_loading_time = time.time() - weights_loading_time
-            print(f"Model weight loading {self.weights_loading_time}s")
+        self.weights_loading_time = time.time() - weights_loading_time
+        print(f"Model weight loading {self.weights_loading_time}s")
+
+        model_loading_start = time.time()
 
         configuration_manager = plans_manager.get_configuration(configuration_name)
 
@@ -263,6 +329,7 @@ class nnUNetPredictor(object):
         (predicting many images at once).
         """
         # Time the file setup phase (everything before creating data iterator)
+        self.total_predict_start = time.time()
         file_setup_start = time.time()
         
         assert part_id <= num_parts, ("Part ID must be smaller than num_parts. Remember that we start counting with 0. "
@@ -408,11 +475,12 @@ class nnUNetPredictor(object):
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
         If 'ofile' is None, the result will be returned instead of written to a file
         """
-        total_predict_start = time.time()
         main_thread_inference_times = []
         background_preprocessing_times = []
         main_thread_wait_for_preprocessing_times = []
         main_thread_wait_for_export_pool_times = []
+        preprocess_subtimes_per_case = {}  # data_id -> dict of sub-timings
+        startup_overhead = 0.0
 
         pool_creation_start = time.time()
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
@@ -426,6 +494,12 @@ class nnUNetPredictor(object):
             queue_wait_start = time.time()
             for preprocessed in data_iterator:
                 queue_wait_elapsed = time.time() - queue_wait_start
+
+                startup_overhead = preprocessed.pop('startup_overhead_seconds', None)
+                if startup_overhead is not None:
+                    startup_overhead = float(startup_overhead)
+                    current = getattr(self, 'data_iterator_setup_time', 0.0)
+                    self.data_iterator_setup_time = max(float(current), startup_overhead)
                 
                 data = preprocessed['data']
                 if isinstance(data, str):
@@ -453,6 +527,14 @@ class nnUNetPredictor(object):
                 if preprocess_time is not None:
                     background_preprocessing_times.append((data_id, preprocess_time))
                     print(f'background_preprocessing_time_seconds for {data_id}: {preprocess_time:.4f}s')
+
+                # Collect preprocessing sub-timings from properties
+                preprocess_subtimes_per_case[data_id] = {
+                    'load_time_seconds': properties.get('_t_load', 0.0),
+                    'crop_time_seconds': properties.get('_t_crop', 0.0),
+                    'norm_time_seconds': properties.get('_t_norm', 0.0),
+                    'resampling_time_seconds': properties.get('_t_resample', 0.0),
+                }
 
                 # let's not get into a runaway situation where the GPU predicts so fast that the disk has to be swamped with
                 # npy files
@@ -489,7 +571,7 @@ class nnUNetPredictor(object):
                         export_pool.starmap_async(
                             _timed_export_prediction_from_logits,
                             ((prediction, properties, self.configuration_manager, self.plans_manager,
-                              self.dataset_json, ofile, save_probabilities),)
+                              self.dataset_json, ofile, save_probabilities, 1, self.spine_process),)
                         )
                     )
                 else:
@@ -514,15 +596,17 @@ class nnUNetPredictor(object):
             ret = []
             background_postprocessing_times = []
             main_thread_wait_for_postprocessing_times = []
+            post_subtimes_per_case = {}  # NEW: dictionary to hold the postprocessing subtimes
             for async_result, data_id in zip(r, export_data_ids):
                 postprocessing_wait_start = time.time()
-                result, export_elapsed = async_result.get()[0]
+                post_times_dict, export_elapsed = async_result.get()[0]
                 postprocessing_wait_elapsed = time.time() - postprocessing_wait_start
                 main_thread_wait_for_postprocessing_times.append((data_id, postprocessing_wait_elapsed))
                 print(f'main_thread_wait_for_postprocessing_seconds for {data_id}: {postprocessing_wait_elapsed:.4f}s')
 
-                ret.append(result)
+                ret.append(post_times_dict)
                 background_postprocessing_times.append((data_id, export_elapsed))
+                post_subtimes_per_case[data_id] = post_times_dict
                 print(f'background_postprocessing_time_seconds for {data_id}: {export_elapsed:.4f}s')
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
@@ -565,34 +649,38 @@ class nnUNetPredictor(object):
                                      'weights_loading_time_seconds', 'main_thread_wait_for_preprocessing_seconds',
                                      'background_preprocessing_time_seconds', 'main_thread_wait_for_export_pool_seconds',
                                      'main_thread_inference_time_seconds', 'main_thread_wait_for_postprocessing_seconds', 'background_postprocessing_time_seconds',
-                                     'unaccounted_main_thread_time_seconds', 'total_time_seconds'])
-                for data_id, t_dict in times_dict.items():
-                    wrapper_time = getattr(self, 'wrapper_loading_time', 0.0)
-                    file_setup_time = getattr(self, 'file_setup_time', 0.0)
-                    data_iterator_setup_time = getattr(self, 'data_iterator_setup_time', 0.0)
-                    model_time = getattr(self, 'model_loading_time', 0.0)
-                    weights_time = getattr(self, 'weights_loading_time', 0.0)
-                    
-                    # Convert to float to handle empty strings or missing values gracefully
-                    wrapper_v = float(wrapper_time) if wrapper_time else 0.0
-                    fs_v = float(file_setup_time) if file_setup_time else 0.0
-                    dis_v = float(data_iterator_setup_time) if data_iterator_setup_time else 0.0
-                    model_v = float(model_time) if model_time else 0.0
-                    weights_v = float(weights_time) if weights_time else 0.0
-                    
-                    wait_prep_v = float(t_dict.get('main_thread_wait_for_preprocessing_seconds', 0.0))
-                    wait_pool_v = float(t_dict.get('main_thread_wait_for_export_pool_seconds', 0.0))
-                    inf_v = float(t_dict.get('main_thread_inference_time_seconds', 0.0))
-                    wait_post_v = float(t_dict.get('main_thread_wait_for_postprocessing_seconds', 0.0))
-                    
-                    if type(total_time) in (float, int):
-                        # Calculate unaccounted string using the MAIN THREAD actions explicitly. 
-                        # Background processes run parallel to the main thread waiting, so we only sum the wait times and inference.
-                        calc_time = (wrapper_v + fs_v + dis_v + pool_creation_time + model_v + weights_v + wait_prep_v + wait_pool_v + inf_v + wait_post_v)
-                        unaccounted_time = total_time - calc_time
-                    else:
-                        unaccounted_time = ''
-                        
+                                     'unaccounted_main_thread_time_seconds', 'case_pipeline_time_seconds', 'pipeline_total_time_seconds'])
+
+                # Compute one-time costs (shared across all cases)
+                wrapper_time = getattr(self, 'wrapper_loading_time', 0.0)
+                file_setup_time = getattr(self, 'file_setup_time', 0.0)
+                data_iterator_setup_time = getattr(self, 'data_iterator_setup_time', 0.0)
+                model_time = getattr(self, 'model_loading_time', 0.0)
+                weights_time = getattr(self, 'weights_loading_time', 0.0)
+
+                wrapper_v = float(wrapper_time) if wrapper_time else 0.0
+                fs_v = float(file_setup_time) if file_setup_time else 0.0
+                dis_v = float(data_iterator_setup_time) if data_iterator_setup_time else 0.0
+                model_v = float(model_time) if model_time else 0.0
+                weights_v = float(weights_time) if weights_time else 0.0
+
+                # Sum all per-case main-thread times to compute batch-level unaccounted
+                sum_all_wait_prep = sum(t for _, t in main_thread_wait_for_preprocessing_times)
+                sum_all_wait_pool = sum(t for _, t in main_thread_wait_for_export_pool_times)
+                sum_all_inf = sum(t for _, t in main_thread_inference_times)
+                sum_all_wait_post = sum(t for _, t in main_thread_wait_for_postprocessing_times)
+
+                if type(total_time) in (float, int):
+                    batch_accounted = (wrapper_v + fs_v + dis_v + pool_creation_time + model_v + weights_v
+                                       + sum_all_wait_prep + sum_all_wait_pool + sum_all_inf + sum_all_wait_post)
+                    batch_unaccounted = total_time - batch_accounted
+                else:
+                    batch_unaccounted = ''
+
+                data_ids_list = list(times_dict.keys())
+                for idx, (data_id, t_dict) in enumerate(times_dict.items()):
+                    is_last = (idx == len(data_ids_list) - 1)
+
                     writer.writerow([
                         data_id,
                         wrapper_time if wrapper_time else '',
@@ -607,10 +695,104 @@ class nnUNetPredictor(object):
                         t_dict.get('main_thread_inference_time_seconds', ''),
                         t_dict.get('main_thread_wait_for_postprocessing_seconds', ''),
                         t_dict.get('background_postprocessing_time_seconds', ''),
-                        unaccounted_time,
-                        total_time
+                        batch_unaccounted if is_last else '',
+                        (t_dict.get('background_preprocessing_time_seconds', 0) or 0) + (t_dict.get('main_thread_inference_time_seconds', 0) or 0) + (t_dict.get('background_postprocessing_time_seconds', 0) or 0),
+                        total_time,
                     ])
             print(f'\nPipeline times saved to {csv_path}')
+
+            # ---- 2. sequential_times.csv (granular, no wait/pool columns) ----
+            seq_csv_path = os.path.join(csv_dir, 'sequential_times.csv')
+            seq_file_exists = os.path.isfile(seq_csv_path)
+            with open(seq_csv_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+
+                seq_header = [
+                    'data_id',
+                    'wrapper_loading_time_seconds',
+                    'model_loading_time_seconds',
+                    'weights_loading_time_seconds',
+                    'load_time_seconds',
+                    'crop_time_seconds',
+                    'norm_time_seconds',
+                    'pre_resampling_time_seconds',
+                    'preprocessing_total_time_seconds',
+                    'inference_time_seconds',
+                    'post_resampling_time_seconds',
+                    'mask_conversion_time_seconds',
+                    'cropping_reverse_time_seconds',
+                    'centroid_extraction_time_seconds',
+                    'export_output_time_seconds',
+                    'postprocessing_time_seconds',
+                ]
+                if self.spine_process:
+                    seq_header.append('spine_postprocessing_time_seconds')
+                seq_header.extend([
+                    'unaccounted_pre_time_seconds',
+                    'unaccounted_post_time_seconds',
+                    'total_time_seconds',
+                ])
+
+                if not seq_file_exists:
+                    writer.writerow(seq_header)
+
+                for data_id, t_dict in times_dict.items():
+                    wrapper_time = getattr(self, 'wrapper_loading_time', 0.0)
+                    model_time = getattr(self, 'model_loading_time', 0.0)
+                    weights_time = getattr(self, 'weights_loading_time', 0.0)
+
+                    sub = preprocess_subtimes_per_case.get(data_id, {})
+                    load_v = sub.get('load_time_seconds', 0.0)
+                    crop_v = sub.get('crop_time_seconds', 0.0)
+                    norm_v = sub.get('norm_time_seconds', 0.0)
+                    pre_resample_v = sub.get('resampling_time_seconds', 0.0)
+                    preprocess_total_v = float(t_dict.get('background_preprocessing_time_seconds', 0.0))
+                    inf_v = float(t_dict.get('main_thread_inference_time_seconds', 0.0))
+                    post_v = float(t_dict.get('background_postprocessing_time_seconds', 0.0))
+
+                    post_sub = post_subtimes_per_case.get(data_id, {})
+                    post_resample_v = post_sub.get('resampling_time_seconds', 0.0)
+                    mask_v = post_sub.get('mask_conversion_time_seconds', 0.0)
+                    crop_rev_v = post_sub.get('cropping_reverse_time_seconds', 0.0)
+                    centroid_v = post_sub.get('centroid_extraction_time_seconds', 0.0)
+                    export_v = post_sub.get('export_output_time_seconds', 0.0)
+
+                    # Per-case total: what this case would cost if run sequentially
+                    per_case_total = preprocess_total_v + inf_v + post_v
+                    # Unaccounted = preprocessing overhead not explained by sub-timings
+                    per_case_unaccounted_pre = preprocess_total_v - (load_v + crop_v + norm_v + pre_resample_v)
+                    per_case_unaccounted_post = post_v - (post_resample_v + mask_v + crop_rev_v + export_v + centroid_v)
+
+                    row = [
+                        data_id,
+                        wrapper_time if wrapper_time else '',
+                        model_time if model_time else '',
+                        weights_time if weights_time else '',
+                        load_v,
+                        crop_v,
+                        norm_v,
+                        pre_resample_v,
+                        preprocess_total_v,
+                        inf_v,
+                        post_resample_v,
+                        mask_v,
+                        crop_rev_v,
+                        centroid_v,
+                        export_v,
+                        post_v,
+                    ]
+                    if self.spine_process:
+                        spine_v = float(t_dict.get('spine_postprocessing_time_seconds', 0.0))
+                        row.append(spine_v)
+                        per_case_total += spine_v
+                    
+                    row.extend([
+                        per_case_unaccounted_pre,
+                        per_case_unaccounted_post,
+                        per_case_total
+                    ])
+                    writer.writerow(row)
+            print(f'Sequential times saved to {seq_csv_path}')
 
         # clear lru cache
         compute_gaussian.cache_clear()
@@ -620,7 +802,7 @@ class nnUNetPredictor(object):
         if hasattr(self, 'script_start_time'):
             total_predict_end = time.time() - self.script_start_time
         else:
-            total_predict_end = time.time() - total_predict_start
+            total_predict_end = time.time() - self.total_predict_start
         print(f"total predict time : {total_predict_end}", flush=True)
         return ret
 
@@ -957,7 +1139,7 @@ class nnUNetPredictor(object):
 
             if of is not None:
                 export_prediction_from_logits(prediction, data_properties, self.configuration_manager, self.plans_manager,
-                  self.dataset_json, of, save_probabilities)
+                  self.dataset_json, of, save_probabilities, 1, self.spine_process)
             else:
                 ret.append(convert_predicted_logits_to_segmentation_with_correct_shape(prediction, self.plans_manager,
                      self.configuration_manager, self.label_manager,
@@ -1026,6 +1208,17 @@ def predict_entry_point_modelfolder():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
+    parser.add_argument('--postprocess', action='store_true', required=False, default=False,
+                        help='Enable vertebra postprocessing for anatomically valid sequences. '
+                             'Corrects mislabelled vertebrae and fills gaps using distance priors.')
+    parser.add_argument('--spine_process', action='store_true', required=False, default=False, help='Enable experimental 3D curve-based spine postprocessing during inference.')
+    parser.add_argument('--fast', action='store_true', required=False, default=False,
+                        help='Use fast inference pipeline: inline preprocessing with GPU resampling, '
+                             'batched sliding window, no multiprocessing overhead. '
+                             'Best for single-image or few-image prediction.')
+    parser.add_argument('-fast_batch_size', type=int, required=False, default=2,
+                        help='Number of patches per GPU forward pass when using --fast. '
+                             'Increase if GPU memory allows for faster inference. Default: 2')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -1062,15 +1255,40 @@ def predict_entry_point_modelfolder():
                                 device=device,
                                 verbose=args.verbose,
                                 allow_tqdm=not args.disable_progress_bar,
-                                verbose_preprocessing=args.verbose)
+                                verbose_preprocessing=args.verbose,
+                                spine_process=args.spine_process)
     predictor.script_start_time = script_start_time
     predictor.initialize_from_trained_model_folder(args.m, args.f, args.chk)
+
+
+    if args.fast:
+        from nnlandmark.inference.nnLandmark.fast_predict import predict_fast
+        print("Running in fast inference mode (GPU preprocessing, batched sliding window, no multiprocessing)")
+        predict_fast(
+            predictor,
+            image_files=args.i,
+            output_folder=args.o,
+            batch_size=args.fast_batch_size,
+            verbose=True,
+        )
+    else:
+        predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
+                                     overwrite=not args.continue_prediction,
+                                     num_processes_preprocessing=args.npp,
+                                     num_processes_segmentation_export=args.nps,
+                                     folder_with_segs_from_prev_stage=args.prev_stage_predictions,
+                                     num_parts=1, part_id=0)
+    """
     predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
                                  overwrite=not args.continue_prediction,
                                  num_processes_preprocessing=args.npp,
                                  num_processes_segmentation_export=args.nps,
                                  folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                  num_parts=1, part_id=0)
+    """
+    # Run postprocessing on all output JSONs if requested
+    if args.postprocess:
+        _run_postprocessing_on_folder(args.i, args.o)
 
 
 def predict_entry_point():
@@ -1137,6 +1355,17 @@ def predict_entry_point():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
+    parser.add_argument('--postprocess', action='store_true', required=False, default=False,
+                        help='Enable vertebra postprocessing for anatomically valid sequences. '
+                             'Corrects mislabelled vertebrae and fills gaps using distance priors.')
+    parser.add_argument('--spine_process', action='store_true', required=False, default=False, help='Enable experimental 3D curve-based spine postprocessing during inference.')
+    parser.add_argument('--fast', action='store_true', required=False, default=False,
+                        help='Use fast inference pipeline: inline preprocessing with GPU resampling, '
+                             'batched sliding window, no multiprocessing overhead. '
+                             'Best for single-image or few-image prediction.')
+    parser.add_argument('-fast_batch_size', type=int, required=False, default=2,
+                        help='Number of patches per GPU forward pass when using --fast. '
+                             'Increase if GPU memory allows for faster inference. Default: 2')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -1184,16 +1413,44 @@ def predict_entry_point():
                                 device=device,
                                 verbose=args.verbose,
                                 verbose_preprocessing=args.verbose,
-                                allow_tqdm=not args.disable_progress_bar)
+                                allow_tqdm=not args.disable_progress_bar,
+                                spine_process=args.spine_process)
     predictor.script_start_time = script_start_time
     predictor.initialize_from_trained_model_folder(
         model_folder,
         args.f,
         checkpoint_name=args.chk
     )
+
+    if args.fast:
+        from nnlandmark.inference.nnLandmark.fast_predict import predict_fast
+        print("Running in fast inference mode (GPU preprocessing, batched sliding window, no multiprocessing)")
+        predict_fast(
+            predictor,
+            image_files=args.i,
+            output_folder=args.o,
+            batch_size=args.fast_batch_size,
+            verbose=True,
+        )
+
+    # run sequential
+    elif args.nps == 0 and args.npp == 0:
+        print("Running in non-multiprocessing mode")
+        predictor.predict_from_files_sequential(args.i, args.o, save_probabilities=args.save_probabilities,
+                                                overwrite=not args.continue_prediction,
+                                                folder_with_segs_from_prev_stage=args.prev_stage_predictions)
+
+    else:
+        predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
+                                    overwrite=not args.continue_prediction,
+                                    num_processes_preprocessing=args.npp,
+                                    num_processes_segmentation_export=args.nps,
+                                    folder_with_segs_from_prev_stage=args.prev_stage_predictions,
+                                    num_parts=args.num_parts,
+                                    part_id=args.part_id)
     
     run_sequential = args.nps == 0 and args.npp == 0
-    
+    """
     if run_sequential:
         
         print("Running in non-multiprocessing mode")
@@ -1209,6 +1466,11 @@ def predict_entry_point():
                                     folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                     num_parts=args.num_parts,
                                     part_id=args.part_id)
+    """
+    
+    # Run postprocessing on all output JSONs if requested
+    if args.postprocess:
+        _run_postprocessing_on_folder(args.i, args.o)
     
     # r = predict_from_raw_data(args.i,
     #                           args.o,

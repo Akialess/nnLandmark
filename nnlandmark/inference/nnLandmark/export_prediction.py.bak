@@ -41,8 +41,7 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
                                                                 label_manager: LabelManager,
                                                                 properties_dict: dict,
                                                                 return_probabilities: bool = False,
-                                                                num_threads_torch: int = default_num_processes,
-                                  spine_process: bool = False):
+                                                                num_threads_torch: int = default_num_processes):
     old_threads = torch.get_num_threads()
     torch.set_num_threads(num_threads_torch)
     post_times = {}
@@ -66,9 +65,11 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
     if isinstance(predicted_logits, np.ndarray):
             predicted_logits = torch.from_numpy(predicted_logits)
     predicted_probabilities = torch.sigmoid(predicted_logits)
+    post_times['activation_time_seconds'] = time.time() - t0
     
+    t0 = time.time()
     segmentation = convert_probabilities_to_segmentation(predicted_probabilities)
-    post_times['mask_conversion_time_seconds'] = time.time() - t0
+    post_times['mask_centroids_time_seconds'] = time.time() - t0
     del predicted_logits
 
     t0 = time.time()
@@ -108,49 +109,36 @@ def _extract_landmark_coord_and_likelihood(probs_zyx: np.ndarray,
                                            top_percent: float = 0.5):
     """
     probs_zyx: (Z, Y, X) ndarray with probabilities in [0,1].
-    Returns ( (x, y, z), likelihood_float ) or (None, 0.0) if empty.
+    - Drop exact 1.0 plateaus (set to 0) to avoid degenerate flats.
+    - Optionally restrict to the top `top_percent`% positive voxels.
+    Returns:
+      ( (x, y, z), likelihood_float ) or (None, 0.0) if empty.
     """
     a = np.asarray(probs_zyx, dtype=np.float32, order='C').copy()
-
-    # Mask to top k% of positive voxels (by value)
-    vals = a[a > 0]
-    n = vals.size
-    k = max(1, int(np.ceil(n * (top_percent / 100.0))))
-
-    if k < n:
-        thr = np.partition(vals, n - k)[n - k]
-        a[a < thr] = 0.0          # zero out everything below threshold in-place
-    else:
-        pass                       # keep all positive voxels
+    a[a == 1.0] = 0.0  # drop perfect plateaus as in your current logic
 
     if not np.any(a > 0):
         return None, 0.0
 
-    # --- Center of mass (weighted average of coordinates) ---
-    total = a.sum()
+    # Mask to top k% of positive voxels (by value), default 0.5%
+    vals = a[a > 0]
+    n = vals.size
+    k = max(1, int(np.ceil(n * (top_percent / 100.0))))
+    if k < n:
+        thr = np.partition(vals, n - k)[n - k]
+        mask = a >= thr
+    else:
+        mask = a > 0
 
-    # Build coordinate grids only along each axis, then broadcast via dot-like ops
-    # This avoids materializing full (Z,Y,X)-shaped index arrays.
-    z_coords = np.arange(a.shape[0], dtype=np.float32)
-    y_coords = np.arange(a.shape[1], dtype=np.float32)
-    x_coords = np.arange(a.shape[2], dtype=np.float32)
+    if not np.any(mask):
+        # Fall back to simple global argmax
+        z, y, x = np.unravel_index(int(np.argmax(a)), a.shape)
+        return (int(x), int(y), int(z)), float(a[z, y, x])
 
-    # sum over Y,X → shape (Z,), then dot with z_coords
-    z_com = z_coords.dot(a.sum(axis=(1, 2))) / total
-    # sum over Z,X → shape (Y,)
-    y_com = y_coords.dot(a.sum(axis=(0, 2))) / total
-    # sum over Z,Y → shape (X,)
-    x_com = x_coords.dot(a.sum(axis=(0, 1))) / total
-
-    # Likelihood: value at the nearest voxel to the centroid
-    zi, yi, xi = (
-        int(np.clip(np.round(z_com), 0, a.shape[0] - 1)),
-        int(np.clip(np.round(y_com), 0, a.shape[1] - 1)),
-        int(np.clip(np.round(x_com), 0, a.shape[2] - 1)),
-    )
-    likelihood = float(a[zi, yi, xi])
-
-    return (float(x_com), float(y_com), float(z_com)), likelihood
+    # Argmax within mask
+    masked = np.where(mask, a, 0.0)
+    z, y, x = np.unravel_index(int(np.argmax(masked)), masked.shape)
+    return (int(x), int(y), int(z)), float(a[z, y, x])
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -163,8 +151,7 @@ def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, tor
                                   dataset_json_dict_or_file: Union[dict, str],
                                   output_file_truncated: str,
                                   save_probabilities: bool = False,
-                                  num_threads_torch: int = default_num_processes,
-                                  spine_process: bool = False):
+                                  num_threads_torch: int = default_num_processes):
 
     if isinstance(dataset_json_dict_or_file, str):
         dataset_json_dict_or_file = load_json(dataset_json_dict_or_file)
@@ -183,8 +170,6 @@ def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, tor
     rw = plans_manager.image_reader_writer_class()
     rw.write_seg(segmentation_final, output_file_truncated + dataset_json_dict_or_file['file_ending'],
                  properties_dict)
-    t1_export = time.time() - t0_export
-    t0_centroid = time.time()
 
     # ── build flat per-class JSON (keys "1","2",..., no case wrapper), incl. likelihood
     probs = probabilities_final
@@ -212,13 +197,11 @@ def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, tor
                 "coordinates": [int(x), int(y), int(z)],
                 "likelihood": float(lik)
             }
-    times['centroid_extraction_time_seconds'] = time.time() - t0_centroid
 
-    t2_export = time.time()
     with open(output_file_truncated + ".json", "w") as f:
         json.dump(out_json, f, indent=4)
-    times['export_output_time_seconds'] = time.time() - t2_export + t1_export
-    
+        
+    times['export_output_time_seconds'] = time.time() - t0_export
     return times
 
 

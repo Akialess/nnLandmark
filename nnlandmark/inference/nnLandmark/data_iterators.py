@@ -24,8 +24,15 @@ def preprocess_fromfiles_save_to_queue(list_of_lists: List[List[str]],
                                        target_queue: Queue,
                                        done_event: Event,
                                        abort_event: Event,
-                                       verbose: bool = False):
+                                       verbose: bool = False,
+                                       main_thread_start_time: float = None):
     try:
+        startup_overhead = None
+        worker_execution_start = time.time()
+        if main_thread_start_time is not None:
+            startup_overhead = worker_execution_start - main_thread_start_time
+            print(f"[Worker] Started! Spawn & import overhead: {startup_overhead:.4f}s", flush=True)
+
         label_manager = plans_manager.get_label_manager(dataset_json)
         preprocessor = configuration_manager.preprocessor_class(verbose=verbose)
         for idx in range(len(list_of_lists)):
@@ -42,10 +49,15 @@ def preprocess_fromfiles_save_to_queue(list_of_lists: List[List[str]],
 
             data = torch.from_numpy(data).to(dtype=torch.float32, memory_format=torch.contiguous_format)
             preprocess_time = time.time() - preprocessed_start
+            
+            queue_put_start = time.time()
 
             item = {'data': data, 'data_properties': data_properties,
                     'ofile': output_filenames_truncated[idx] if output_filenames_truncated is not None else None,
                     'preprocess_time': preprocess_time}
+            if startup_overhead is not None:
+                item['startup_overhead_seconds'] = startup_overhead
+                startup_overhead = None
             success = False
             while not success:
                 try:
@@ -55,6 +67,10 @@ def preprocess_fromfiles_save_to_queue(list_of_lists: List[List[str]],
                     success = True
                 except queue.Full:
                     pass
+            
+            queue_put_time = time.time() - queue_put_start
+            print(f"[Worker] Time to serialize and queue data: {queue_put_time:.4f}s", flush=True)
+            
         done_event.set()
     except Exception as e:
         # print(Exception, e)
@@ -71,6 +87,7 @@ def preprocessing_iterator_fromfiles(list_of_lists: List[List[str]],
                                      num_processes: int,
                                      pin_memory: bool = False,
                                      verbose: bool = False):
+    main_thread_start_time = time.time()
     context = multiprocessing.get_context('spawn')
     manager = Manager()
     num_processes = min(len(list_of_lists), num_processes)
@@ -95,7 +112,8 @@ def preprocessing_iterator_fromfiles(list_of_lists: List[List[str]],
                          queue,
                          event,
                          abort_event,
-                         verbose
+                         verbose,
+                         main_thread_start_time
                      ), daemon=True)
         pr.start()
         target_queues.append(queue)
@@ -103,10 +121,14 @@ def preprocessing_iterator_fromfiles(list_of_lists: List[List[str]],
         processes.append(pr)
 
     worker_ctr = 0
+    main_thread_queue_wait_start = time.time()
     while (not done_events[worker_ctr].is_set()) or (not target_queues[worker_ctr].empty()):
         # import IPython;IPython.embed()
         if not target_queues[worker_ctr].empty():
+            q_get_start = time.time()
             item = target_queues[worker_ctr].get()
+            q_get_time = time.time() - q_get_start
+            print(f"[Main Thread] Time to deserialize data from queue: {q_get_time:.4f}s", flush=True)
             worker_ctr = (worker_ctr + 1) % num_processes
         else:
             all_ok = all(
@@ -222,8 +244,15 @@ def preprocess_fromnpy_save_to_queue(list_of_images: List[np.ndarray],
                                      target_queue: Queue,
                                      done_event: Event,
                                      abort_event: Event,
-                                     verbose: bool = False):
+                                     verbose: bool = False,
+                                     main_thread_start_time: float = None):
     try:
+        startup_overhead = None
+        worker_execution_start = time.time()
+        if main_thread_start_time is not None:
+            startup_overhead = worker_execution_start - main_thread_start_time
+            print(f"[Worker] Started! Spawn & import overhead: {startup_overhead:.4f}s", flush=True)
+
         label_manager = plans_manager.get_label_manager(dataset_json)
         preprocessor = configuration_manager.preprocessor_class(verbose=verbose)
         for idx in range(len(list_of_images)):
@@ -240,9 +269,14 @@ def preprocess_fromnpy_save_to_queue(list_of_images: List[np.ndarray],
                 data = np.vstack((data, seg_onehot))
 
             data = torch.from_numpy(data).to(dtype=torch.float32, memory_format=torch.contiguous_format)
+            
+            queue_put_start = time.time()
 
             item = {'data': data, 'data_properties': list_of_image_properties[idx],
                     'ofile': truncated_ofnames[idx] if truncated_ofnames is not None else None}
+            if startup_overhead is not None:
+                item['startup_overhead_seconds'] = startup_overhead
+                startup_overhead = None
             success = False
             while not success:
                 try:
@@ -252,6 +286,10 @@ def preprocess_fromnpy_save_to_queue(list_of_images: List[np.ndarray],
                     success = True
                 except queue.Full:
                     pass
+            
+            queue_put_time = time.time() - queue_put_start
+            print(f"[Worker] Time to serialize and queue npy data: {queue_put_time:.4f}s", flush=True)
+            
         done_event.set()
     except Exception as e:
         abort_event.set()
@@ -276,6 +314,7 @@ def preprocessing_iterator_fromnpy(list_of_images: List[np.ndarray],
     processes = []
     done_events = []
     abort_event = manager.Event()
+    main_thread_start_time = time.time()
     for i in range(num_processes):
         event = manager.Event()
         queue = manager.Queue(maxsize=1)
@@ -292,7 +331,8 @@ def preprocessing_iterator_fromnpy(list_of_images: List[np.ndarray],
                          queue,
                          event,
                          abort_event,
-                         verbose
+                         verbose,
+                         main_thread_start_time
                      ), daemon=True)
         pr.start()
         done_events.append(event)
@@ -302,7 +342,10 @@ def preprocessing_iterator_fromnpy(list_of_images: List[np.ndarray],
     worker_ctr = 0
     while (not done_events[worker_ctr].is_set()) or (not target_queues[worker_ctr].empty()):
         if not target_queues[worker_ctr].empty():
+            q_get_start = time.time()
             item = target_queues[worker_ctr].get()
+            q_get_time = time.time() - q_get_start
+            print(f"[Main Thread] Time to deserialize npy data from queue: {q_get_time:.4f}s", flush=True)
             worker_ctr = (worker_ctr + 1) % num_processes
         else:
             all_ok = all(

@@ -1,6 +1,6 @@
 import multiprocessing, os
 from copy import deepcopy
-from time import sleep
+from time import sleep, time
 from typing import Union, Tuple, List
 from pathlib import Path
 
@@ -70,9 +70,10 @@ from nnlandmark.training.nnUNetTrainer.variants.data_augmentation.nnUNetTrainerD
 from nnlandmark.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnlandmark.utilities.file_path_utilities import check_workers_alive_and_busy
 from nnlandmark.utilities.helpers import dummy_context, empty_cache
+from nnlandmark.utilities.collate_outputs import collate_outputs
 
 #from nnlandmark.training.nnUNetTrainer.project_specific.nnLandmark.landmark_architectures.BiFormer_Unet import BiFormer_Unet
-
+from torch import distributed as dist
 
 
 # *******************************************************************************************************************************************
@@ -301,7 +302,7 @@ class ConvertSegToLandmarkTarget(BasicTransform):
     def __init__(self,
                  n_landmarks: int,
                  target_type: str = 'EDT',
-                 gaussian_sigma: float = 5,
+                 gaussian_sigma: float = 6,
                  edt_radius: int = 15,
                  ):
         super().__init__()
@@ -1059,6 +1060,84 @@ class nnLandmark_trainer_base(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep
 
         return {'loss': l.detach().cpu().numpy()}
 
+    def on_validation_epoch_end(self, val_outputs: List[dict]):
+        outputs_collated = collate_outputs(val_outputs)
+
+        if self.is_ddp:
+            world_size = dist.get_world_size()
+            losses_val = [None for _ in range(world_size)]
+            dist.all_gather_object(losses_val, outputs_collated['loss'])
+            loss_here = np.vstack(losses_val).mean()
+        else:
+            loss_here = np.mean(outputs_collated['loss'])
+
+        self.logger.log('mean_fg_dice', -loss_here, self.current_epoch)
+        self.logger.log('dice_per_class_or_region', [-loss_here], self.current_epoch)
+        self.logger.log('val_losses', loss_here, self.current_epoch)
+
+    def on_epoch_end(self):
+        self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
+
+        self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
+        self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file(
+            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
+
+        current_epoch = self.current_epoch
+        if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
+            self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
+
+        if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
+            self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+            self.print_to_log_file(f"Yayy! New best EMA val loss: {np.round(-self._best_ema, decimals=4)}")
+            self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
+
+        if self.local_rank == 0:
+            self._plot_progress_png(self.output_folder)
+
+        self.current_epoch += 1
+
+    def _plot_progress_png(self, output_folder):
+        import matplotlib
+        matplotlib.use('agg')
+        import seaborn as sns
+        import matplotlib.pyplot as plt
+
+        epoch = min([len(i) for i in self.logger.my_fantastic_logging.values()]) - 1
+        sns.set(font_scale=2.5)
+        fig, ax_all = plt.subplots(3, 1, figsize=(30, 54))
+
+        ax = ax_all[0]
+        x_values = list(range(epoch + 1))
+        ax.plot(x_values, self.logger.my_fantastic_logging['train_losses'][:epoch + 1], color='b', ls='-', label="loss_tr", linewidth=4)
+        ax.plot(x_values, self.logger.my_fantastic_logging['val_losses'][:epoch + 1], color='r', ls='-', label="loss_val", linewidth=4)
+        ema_losses = [-v for v in self.logger.my_fantastic_logging['ema_fg_dice'][:epoch + 1]]
+        ax.plot(x_values, ema_losses, color='g', ls='-', label="val_loss (mov. avg.)", linewidth=4)
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("loss")
+        ax.legend(loc=(0, 1))
+
+        ax = ax_all[1]
+        ax.plot(x_values, [i - j for i, j in zip(self.logger.my_fantastic_logging['epoch_end_timestamps'][:epoch + 1],
+                                                  self.logger.my_fantastic_logging['epoch_start_timestamps'])][:epoch + 1], color='b',
+                ls='-', label="epoch duration", linewidth=4)
+        ylim = [0] + [ax.get_ylim()[1]]
+        ax.set(ylim=ylim)
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("time [s]")
+        ax.legend(loc=(0, 1))
+
+        ax = ax_all[2]
+        ax.plot(x_values, self.logger.my_fantastic_logging['lrs'][:epoch + 1], color='b', ls='-', label="learning rate", linewidth=4)
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("learning rate")
+        ax.legend(loc=(0, 1))
+
+        plt.tight_layout()
+        fig.savefig(join(output_folder, "progress.png"))
+        plt.close()
+
+
     def _build_loss(self):
         loss = BCE_topK_loss_landmark(k=20)
 
@@ -1168,6 +1247,7 @@ class nnLandmark(nnLandmark_trainer_base):
         self.blobb_radius = 15
         self.enable_deep_supervision = False
         self.blobb_type = 'EDT'
+        #self.blobb_type = 'Gaussian'
 
         self.print_to_log_file(
             "\n#######################################################################\n"
@@ -1361,7 +1441,7 @@ class nnLandmark_v1(nnLandmark):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
-        self.blobb_radius = 4
+        self.blobb_radius = 5
         self.enable_deep_supervision = False
         self.blobb_type = 'Gaussian'
         self.initial_lr = 5e-4

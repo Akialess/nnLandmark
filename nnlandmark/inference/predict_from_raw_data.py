@@ -1,7 +1,9 @@
+import csv
 import inspect
 import itertools
 import multiprocessing
 import os
+import time
 from copy import deepcopy
 from queue import Queue
 from threading import Thread
@@ -34,6 +36,18 @@ from nnlandmark.utilities.json_export import recursive_fix_for_json_export
 from nnlandmark.utilities.label_handling.label_handling import determine_num_input_channels
 from nnlandmark.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnlandmark.utilities.utils import create_lists_from_splitted_dataset_folder
+
+
+def _timed_export_prediction_from_logits(*args, **kwargs):
+    start = time.time()
+    result = export_prediction_from_logits(*args, **kwargs)
+    return result, time.time() - start
+
+
+def _timed_convert_predicted_logits_to_segmentation_with_correct_shape(*args, **kwargs):
+    start = time.time()
+    result = convert_predicted_logits_to_segmentation_with_correct_shape(*args, **kwargs)
+    return result, time.time() - start
 
 
 class nnUNetPredictor(object):
@@ -218,6 +232,9 @@ class nnUNetPredictor(object):
         This is nnU-Net's default function for making predictions. It works best for batch predictions
         (predicting many images at once).
         """
+        # Time the file setup phase (everything before creating data iterator)
+        file_setup_start = time.time()
+
         assert part_id <= num_parts, ("Part ID must be smaller than num_parts. Remember that we start counting with 0. "
                                       "So if there are 3 parts then valid part IDs are 0, 1, 2")
         if isinstance(output_folder_or_list_of_truncated_output_files, str):
@@ -226,6 +243,8 @@ class nnUNetPredictor(object):
             output_folder = os.path.dirname(output_folder_or_list_of_truncated_output_files[0])
         else:
             output_folder = None
+
+        self.output_folder = output_folder
 
         ########################
         # let's store the input arguments so that its clear what was used to generate the prediction
@@ -260,10 +279,15 @@ class nnUNetPredictor(object):
         if len(list_of_lists_or_source_folder) == 0:
             return
 
+        self.file_setup_time = time.time() - file_setup_start
+
+        data_pre = time.time()
         data_iterator = self._internal_get_data_iterator_from_lists_of_filenames(list_of_lists_or_source_folder,
                                                                                  seg_from_prev_stage_files,
                                                                                  output_filename_truncated,
                                                                                  num_processes_preprocessing)
+        self.data_iterator_setup_time = time.time() - data_pre
+        print(f"data preprocessing total : {self.data_iterator_setup_time}s", flush=True)
 
         return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
 
@@ -355,10 +379,37 @@ class nnUNetPredictor(object):
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
         If 'ofile' is None, the result will be returned instead of written to a file
         """
+        total_predict_start = time.time()
+        main_thread_inference_times = []
+        background_preprocessing_times = []
+        main_thread_wait_for_preprocessing_times = []
+        main_thread_wait_for_export_pool_times = []
+        preprocess_subtimes_per_case = {}  # data_id -> dict of sub-timings
+        startup_overhead_max = 0.0
+
+        pool_creation_start = time.time()
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
+            pool_creation_time = time.time() - pool_creation_start
+            print(f'pool_creation_time_seconds: {pool_creation_time:.4f}s')
+
             worker_list = [i for i in export_pool._pool]
             r = []
+            export_data_ids = []
+
+            queue_wait_start = time.time()
             for preprocessed in data_iterator:
+                queue_wait_elapsed = time.time() - queue_wait_start
+
+                startup_overhead = preprocessed.pop('startup_overhead_seconds', None)
+                if startup_overhead is not None:
+                    startup_overhead_max = max(startup_overhead_max, float(startup_overhead))
+                    current = getattr(self, 'data_iterator_setup_time', 0.0)
+                    try:
+                        current = float(current)
+                    except (TypeError, ValueError):
+                        current = 0.0
+                    self.data_iterator_setup_time = max(current, startup_overhead_max)
+
                 data = preprocessed['data']
                 if isinstance(data, str):
                     delfile = data
@@ -367,29 +418,63 @@ class nnUNetPredictor(object):
 
                 ofile = preprocessed['ofile']
                 if ofile is not None:
+                    data_id = os.path.basename(ofile)
                     print(f'\nPredicting {os.path.basename(ofile)}:')
                 else:
+                    data_id = f'image_shape_{"x".join(str(s) for s in data.shape)}'
                     print(f'\nPredicting image of shape {data.shape}:')
+
+                main_thread_wait_for_preprocessing_times.append((data_id, queue_wait_elapsed))
+                print(f'main_thread_wait_for_preprocessing_seconds for {data_id}: {queue_wait_elapsed:.4f}s')
 
                 print(f'perform_everything_on_device: {self.perform_everything_on_device}')
 
                 properties = preprocessed['data_properties']
 
+                # Collect background preprocessing time
+                preprocess_time = preprocessed.get('preprocess_time', None)
+                if preprocess_time is not None:
+                    background_preprocessing_times.append((data_id, preprocess_time))
+                    print(f'background_preprocessing_time_seconds for {data_id}: {preprocess_time:.4f}s')
+
+                # Collect preprocessing sub-timings from properties
+                preprocess_subtimes_per_case[data_id] = {
+                    'load_time_seconds': properties.get('_t_load', 0.0),
+                    'crop_time_seconds': properties.get('_t_crop', 0.0),
+                    'norm_time_seconds': properties.get('_t_norm', 0.0),
+                    'resampling_time_seconds': properties.get('_t_resample', 0.0),
+                }
+
                 # let's not get into a runaway situation where the GPU predicts so fast that the disk has to be swamped with
                 # npy files
+                export_pool_wait_start = time.time()
                 proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
                 while not proceed:
                     sleep(0.1)
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
+                export_pool_wait_elapsed = time.time() - export_pool_wait_start
+                main_thread_wait_for_export_pool_times.append((data_id, export_pool_wait_elapsed))
+                print(f'main_thread_wait_for_export_pool_seconds for {data_id}: {export_pool_wait_elapsed:.4f}s')
+
+                # Compute inference time
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize()
+                start_time = time.time()
 
                 # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
                 prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize()
+                elapsed = time.time() - start_time
+                main_thread_inference_times.append((data_id, elapsed))
+                print(f'main_thread_inference_time_seconds for {data_id}: {elapsed:.4f}s')
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
                     r.append(
                         export_pool.starmap_async(
-                            export_prediction_from_logits,
+                            _timed_export_prediction_from_logits,
                             ((prediction, properties, self.configuration_manager, self.plans_manager,
                               self.dataset_json, ofile, save_probabilities),)
                         )
@@ -398,26 +483,198 @@ class nnUNetPredictor(object):
                     print('sending off prediction to background worker for resampling')
                     r.append(
                         export_pool.starmap_async(
-                            convert_predicted_logits_to_segmentation_with_correct_shape, (
+                            _timed_convert_predicted_logits_to_segmentation_with_correct_shape, (
                                 (prediction, self.plans_manager,
                                  self.configuration_manager, self.label_manager,
                                  properties,
                                  save_probabilities),)
                         )
                     )
+                export_data_ids.append(data_id)
                 if ofile is not None:
                     print(f'done with {os.path.basename(ofile)}')
                 else:
                     print(f'\nDone with image of shape {data.shape}:')
-            ret = [i.get()[0] for i in r]
+
+                queue_wait_start = time.time()
+
+            ret = []
+            background_postprocessing_times = []
+            main_thread_wait_for_postprocessing_times = []
+            for async_result, data_id in zip(r, export_data_ids):
+                postprocessing_wait_start = time.time()
+                result, export_elapsed = async_result.get()[0]
+                postprocessing_wait_elapsed = time.time() - postprocessing_wait_start
+                main_thread_wait_for_postprocessing_times.append((data_id, postprocessing_wait_elapsed))
+                print(f'main_thread_wait_for_postprocessing_seconds for {data_id}: {postprocessing_wait_elapsed:.4f}s')
+
+                ret.append(result)
+                background_postprocessing_times.append((data_id, export_elapsed))
+                print(f'background_postprocessing_time_seconds for {data_id}: {export_elapsed:.4f}s')
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
             data_iterator._finish()
+
+        # save times to CSV files
+        if main_thread_inference_times or background_preprocessing_times or background_postprocessing_times:
+            if hasattr(self, 'output_folder') and self.output_folder is not None:
+                csv_dir = self.output_folder
+            else:
+                try:
+                    csv_dir = os.path.dirname(os.path.abspath(ofile)) if ofile is not None else os.getcwd()
+                except Exception:
+                    csv_dir = os.getcwd()
+
+            times_dict = {}
+            for data_id, t in background_preprocessing_times:
+                times_dict.setdefault(data_id, {})['background_preprocessing_time_seconds'] = t
+            for data_id, t in main_thread_inference_times:
+                times_dict.setdefault(data_id, {})['main_thread_inference_time_seconds'] = t
+            for data_id, t in background_postprocessing_times:
+                times_dict.setdefault(data_id, {})['background_postprocessing_time_seconds'] = t
+            for data_id, t in main_thread_wait_for_preprocessing_times:
+                times_dict.setdefault(data_id, {})['main_thread_wait_for_preprocessing_seconds'] = t
+            for data_id, t in main_thread_wait_for_export_pool_times:
+                times_dict.setdefault(data_id, {})['main_thread_wait_for_export_pool_seconds'] = t
+            for data_id, t in main_thread_wait_for_postprocessing_times:
+                times_dict.setdefault(data_id, {})['main_thread_wait_for_postprocessing_seconds'] = t
+
+            # Compute total time if script_start_time was set
+            total_time = time.time() - self.script_start_time if hasattr(self, 'script_start_time') else ''
+
+            # ---- 1. pipeline_times.csv ----
+            csv_path = os.path.join(csv_dir, 'pipeline_times.csv')
+            file_exists = os.path.isfile(csv_path)
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(['data_id', 'wrapper_loading_time_seconds', 'file_setup_time_seconds',
+                                     'data_iterator_setup_time_seconds', 'pool_creation_time_seconds', 'model_loading_time_seconds',
+                                     'weights_loading_time_seconds', 'main_thread_wait_for_preprocessing_seconds',
+                                     'background_preprocessing_time_seconds', 'main_thread_wait_for_export_pool_seconds',
+                                     'main_thread_inference_time_seconds', 'main_thread_wait_for_postprocessing_seconds', 'background_postprocessing_time_seconds',
+                                     'unaccounted_main_thread_time_seconds', 'batch_total_time_seconds'])
+
+                # Compute one-time costs (shared across all cases)
+                wrapper_time = getattr(self, 'wrapper_loading_time', 0.0)
+                file_setup_time = getattr(self, 'file_setup_time', 0.0)
+                data_iterator_setup_time = getattr(self, 'data_iterator_setup_time', 0.0)
+                model_time = getattr(self, 'model_loading_time', 0.0)
+                weights_time = getattr(self, 'weights_loading_time', 0.0)
+
+                wrapper_v = float(wrapper_time) if wrapper_time else 0.0
+                fs_v = float(file_setup_time) if file_setup_time else 0.0
+                dis_v = float(data_iterator_setup_time) if data_iterator_setup_time else 0.0
+                model_v = float(model_time) if model_time else 0.0
+                weights_v = float(weights_time) if weights_time else 0.0
+
+                # Sum all per-case main-thread times to compute batch-level unaccounted
+                sum_all_wait_prep = sum(t for _, t in main_thread_wait_for_preprocessing_times)
+                sum_all_wait_pool = sum(t for _, t in main_thread_wait_for_export_pool_times)
+                sum_all_inf = sum(t for _, t in main_thread_inference_times)
+                sum_all_wait_post = sum(t for _, t in main_thread_wait_for_postprocessing_times)
+
+                if type(total_time) in (float, int):
+                    batch_accounted = (wrapper_v + fs_v + dis_v + pool_creation_time + model_v + weights_v
+                                       + sum_all_wait_prep + sum_all_wait_pool + sum_all_inf + sum_all_wait_post)
+                    batch_unaccounted = total_time - batch_accounted
+                else:
+                    batch_unaccounted = ''
+
+                data_ids_list = list(times_dict.keys())
+                for idx, (data_id, t_dict) in enumerate(times_dict.items()):
+                    is_last = (idx == len(data_ids_list) - 1)
+
+                    writer.writerow([
+                        data_id,
+                        wrapper_time if wrapper_time else '',
+                        file_setup_time if file_setup_time else '',
+                        data_iterator_setup_time if data_iterator_setup_time else '',
+                        pool_creation_time,
+                        model_time if model_time else '',
+                        weights_time if weights_time else '',
+                        t_dict.get('main_thread_wait_for_preprocessing_seconds', ''),
+                        t_dict.get('background_preprocessing_time_seconds', ''),
+                        t_dict.get('main_thread_wait_for_export_pool_seconds', ''),
+                        t_dict.get('main_thread_inference_time_seconds', ''),
+                        t_dict.get('main_thread_wait_for_postprocessing_seconds', ''),
+                        t_dict.get('background_postprocessing_time_seconds', ''),
+                        batch_unaccounted if is_last else '',
+                        total_time if is_last else '',
+                    ])
+            print(f'\nPipeline times saved to {csv_path}')
+
+            # ---- 2. sequential_times.csv (granular, no wait/pool columns) ----
+            seq_csv_path = os.path.join(csv_dir, 'sequential_times.csv')
+            seq_file_exists = os.path.isfile(seq_csv_path)
+            with open(seq_csv_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+
+                seq_header = [
+                    'data_id',
+                    'wrapper_loading_time_seconds',
+                    'model_loading_time_seconds',
+                    'weights_loading_time_seconds',
+                    'load_time_seconds',
+                    'crop_time_seconds',
+                    'norm_time_seconds',
+                    'resampling_time_seconds',
+                    'preprocessing_total_time_seconds',
+                    'inference_time_seconds',
+                    'postprocessing_time_seconds',
+                    'unaccounted_time_seconds',
+                    'total_time_seconds',
+                ]
+
+                if not seq_file_exists:
+                    writer.writerow(seq_header)
+
+                for data_id, t_dict in times_dict.items():
+                    wrapper_time = getattr(self, 'wrapper_loading_time', 0.0)
+                    model_time = getattr(self, 'model_loading_time', 0.0)
+                    weights_time = getattr(self, 'weights_loading_time', 0.0)
+
+                    sub = preprocess_subtimes_per_case.get(data_id, {})
+                    load_v = sub.get('load_time_seconds', 0.0)
+                    crop_v = sub.get('crop_time_seconds', 0.0)
+                    norm_v = sub.get('norm_time_seconds', 0.0)
+                    resample_v = sub.get('resampling_time_seconds', 0.0)
+                    preprocess_total_v = float(t_dict.get('background_preprocessing_time_seconds', 0.0))
+                    inf_v = float(t_dict.get('main_thread_inference_time_seconds', 0.0))
+                    post_v = float(t_dict.get('background_postprocessing_time_seconds', 0.0))
+
+                    # Per-case total: what this case would cost if run sequentially
+                    per_case_total = preprocess_total_v + inf_v + post_v
+                    # Unaccounted = preprocessing overhead not explained by sub-timings
+                    per_case_unaccounted = preprocess_total_v - (load_v + crop_v + norm_v + resample_v)
+
+                    writer.writerow([
+                        data_id,
+                        wrapper_time if wrapper_time else '',
+                        model_time if model_time else '',
+                        weights_time if weights_time else '',
+                        load_v,
+                        crop_v,
+                        norm_v,
+                        resample_v,
+                        preprocess_total_v,
+                        inf_v,
+                        post_v,
+                        per_case_unaccounted,
+                        per_case_total,
+                    ])
+            print(f'Sequential times saved to {seq_csv_path}')
 
         # clear lru cache
         compute_gaussian.cache_clear()
         # clear device cache
         empty_cache(self.device)
+
+        if hasattr(self, 'script_start_time'):
+            total_predict_end = time.time() - self.script_start_time
+        else:
+            total_predict_end = time.time() - total_predict_start
+        print(f"total predict time : {total_predict_end}", flush=True)
         return ret
 
     def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,

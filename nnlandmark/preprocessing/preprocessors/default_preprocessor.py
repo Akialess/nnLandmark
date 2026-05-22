@@ -34,6 +34,7 @@ from nnlandmark.utilities.find_class_by_name import recursive_find_python_class
 from nnlandmark.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnlandmark.utilities.utils import get_filenames_of_train_images_and_targets
 
+import time
 
 class DefaultPreprocessor(object):
     def __init__(self, verbose: bool = True):
@@ -45,6 +46,8 @@ class DefaultPreprocessor(object):
     def run_case_npy(self, data: np.ndarray, seg: Union[np.ndarray, None], properties: dict,
                      plans_manager: PlansManager, configuration_manager: ConfigurationManager,
                      dataset_json: Union[dict, str]):
+        t0_npy = time.time()
+        
         # let's not mess up the inputs!
         data = data.astype(np.float32)  # this creates a copy
         if seg is not None:
@@ -63,7 +66,9 @@ class DefaultPreprocessor(object):
         shape_before_cropping = data.shape[1:]
         properties['shape_before_cropping'] = shape_before_cropping
         # this command will generate a segmentation. This is important because of the nonzero mask which we may need
+        t_before_crop = time.time()
         data, seg, bbox = crop_to_nonzero(data, seg)
+        t_crop = time.time() - t_before_crop
         properties['bbox_used_for_cropping'] = bbox
         # print(data.shape, seg.shape)
         properties['shape_after_cropping_and_before_resampling'] = data.shape[1:]
@@ -80,14 +85,18 @@ class DefaultPreprocessor(object):
         # normalize
         # normalization MUST happen before resampling or we get huge problems with resampled nonzero masks no
         # longer fitting the images perfectly!
+        t_before_norm = time.time()
         data = self._normalize(data, seg, configuration_manager,
                                plans_manager.foreground_intensity_properties_per_channel)
+        t_norm = time.time() - t_before_norm
 
         # print('current shape', data.shape[1:], 'current_spacing', original_spacing,
         #       '\ntarget shape', new_shape, 'target_spacing', target_spacing)
         old_shape = data.shape[1:]
+        t_before_resample = time.time()
         data = configuration_manager.resampling_fn_data(data, new_shape, original_spacing, target_spacing)
         seg = configuration_manager.resampling_fn_seg(seg, new_shape, original_spacing, target_spacing)
+        t_resample = time.time() - t_before_resample
         if self.verbose:
             print(f'old shape: {old_shape}, new_shape: {new_shape}, old_spacing: {original_spacing}, '
                   f'new_spacing: {target_spacing}, fn_data: {configuration_manager.resampling_fn_data}')
@@ -115,6 +124,13 @@ class DefaultPreprocessor(object):
             seg = seg.astype(np.int16)
         else:
             seg = seg.astype(np.int8)
+            
+        properties['_t_crop'] = t_crop
+        properties['_t_norm'] = t_norm
+        properties['_t_resample'] = t_resample
+        # time spent in run_case_npy that isn't crop, norm, or resample
+        properties['_t_npy_other'] = time.time() - t0_npy - t_crop - t_norm - t_resample
+        
         return data, seg, properties
 
     def run_case(self, image_files: List[str], seg_file: Union[str, None], plans_manager: PlansManager,
@@ -127,6 +143,9 @@ class DefaultPreprocessor(object):
         so when we export we need to run the following order: resample -> crop -> transpose (we could also run
         transpose at a different place, but reverting the order of operations done during preprocessing seems cleaner)
         """
+        import time
+        t0 = time.time()
+        
         if isinstance(dataset_json, str):
             dataset_json = load_json(dataset_json)
 
@@ -140,11 +159,24 @@ class DefaultPreprocessor(object):
             seg, _ = rw.read_seg(seg_file)
         else:
             seg = None
+            
+        t_load = time.time() - t0
 
         if self.verbose:
             print(seg_file)
         data, seg, data_properties = self.run_case_npy(data, seg, data_properties, plans_manager, configuration_manager,
                                       dataset_json)
+        
+        data_properties['_t_load'] = t_load
+                                      
+        if True:
+            t_crop = data_properties.get('_t_crop', 0.0)
+            t_norm = data_properties.get('_t_norm', 0.0)
+            t_resample = data_properties.get('_t_resample', 0.0)
+            t_npy_other = data_properties.get('_t_npy_other', 0.0)
+            t_total = t_load + t_crop + t_norm + t_resample + t_npy_other
+            print(f'[normal preprocess] load={t_load:.3f}s  crop={t_crop:.3f}s  norm={t_norm:.3f}s  resample(CPU)={t_resample:.3f}s  total={t_total:.3f}s')
+
         return data, seg, data_properties
 
     def run_case_save(self, output_filename_truncated: str, image_files: List[str], seg_file: str,

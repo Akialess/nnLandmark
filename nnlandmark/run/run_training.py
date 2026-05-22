@@ -124,6 +124,8 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     if torch.cuda.is_available():
         cudnn.deterministic = False
         cudnn.benchmark = True
+        if "nnUNet_cudnn_benchmark" in os.environ.keys() and os.environ["nnUNet_cudnn_benchmark"].lower() in ("false", "0", "f"):
+            cudnn.benchmark = False
 
     if not val:
         nnunet_trainer.run_training()
@@ -202,6 +204,8 @@ def run_training(dataset_name_or_id: Union[str, int],
         if torch.cuda.is_available():
             cudnn.deterministic = False
             cudnn.benchmark = True
+        if "nnUNet_cudnn_benchmark" in os.environ.keys() and os.environ["nnUNet_cudnn_benchmark"].lower() in ("false", "0", "f"):
+            cudnn.benchmark = False
 
         if not only_run_validation:
             nnunet_trainer.run_training()
