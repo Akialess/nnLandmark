@@ -1359,9 +1359,9 @@ class nnLandmark(nnLandmark_trainer_base):
 
 
 class nnLandmark_v1(nnLandmark):
-    '''
-    Very first nnLandmark version used arxiv paper v1&2.
-    '''
+    
+    #Very first nnLandmark version used arxiv paper v1&2.
+    
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
@@ -1561,3 +1561,4 @@ class nnLandmark_edt23(nnLandmark):
 #         chances you need to change this as well!
 #         """
 #         print("Deep supervision toggle not implemented for BiFormer_Unet. Ignoring.")
+
