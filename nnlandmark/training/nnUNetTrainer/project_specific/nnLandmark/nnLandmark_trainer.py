@@ -927,7 +927,11 @@ class nnLandmark_trainer_base(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep
                 # *********************************************************
                 # generate a segmentation visualizing the predicted coords
 
-                seg = generate_segmentation(properties['shape_before_cropping'], {i: out_dict[i]['coordinates'] for i in out_dict.keys()}, radius=4)
+                vis_coords = {
+                    i: list(out_dict[i]['coordinates'])[::-1]
+                    for i in out_dict.keys()
+                }
+                seg = generate_segmentation(properties['shape_before_cropping'], vis_coords, radius=4)
                 self.plans_manager.image_reader_writer_class().write_seg(seg, join(validation_output_folder, k + self.dataset_json['file_ending']), properties)
 
                 # If we loaded with nibabel with reorient we need to revert any potential reorientation we did
