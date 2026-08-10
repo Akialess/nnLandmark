@@ -928,7 +928,11 @@ class nnLandmark_trainer_base(MotorRegressionTrainer_BCEtopK20Loss_moreDA_3_5kep
                 # *********************************************************
                 # generate a segmentation visualizing the predicted coords
 
-                seg = generate_segmentation(properties['shape_before_cropping'], {i: out_dict[i]['coordinates'] for i in out_dict.keys()}, radius=4)
+                vis_coords = {
+                    i: list(out_dict[i]['coordinates'])[::-1]
+                    for i in out_dict.keys()
+                }
+                seg = generate_segmentation(properties['shape_before_cropping'], vis_coords, radius=4)
                 self.plans_manager.image_reader_writer_class().write_seg(seg, join(validation_output_folder, k + self.dataset_json['file_ending']), properties)
 
                 # If we loaded with nibabel with reorient we need to revert any potential reorientation we did
@@ -1435,9 +1439,9 @@ class nnLandmark(nnLandmark_trainer_base):
 
 
 class nnLandmark_v1(nnLandmark):
-    '''
-    Very first nnLandmark version used arxiv paper v1&2.
-    '''
+    
+    #Very first nnLandmark version used arxiv paper v1&2.
+    
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
@@ -1637,3 +1641,4 @@ class nnLandmark_edt23(nnLandmark):
 #         chances you need to change this as well!
 #         """
 #         print("Deep supervision toggle not implemented for BiFormer_Unet. Ignoring.")
+

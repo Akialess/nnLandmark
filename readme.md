@@ -3,7 +3,7 @@
 This repository contains the implementation of nnLandmark, a self-configuring framework for 3D medical landmark detection.
 
 🚀 nnLandmark is accepted to MIDL 2026! 
-Find the preprind on arxiv: &nbsp; &nbsp;   [![arXiv](https://img.shields.io/badge/arXiv-2404.03010-B31B1B.svg)](https://arxiv.org/abs/2504.06742)
+Find the preprint on arxiv: &nbsp; &nbsp;   [![arXiv](https://img.shields.io/badge/arXiv-2404.03010-B31B1B.svg)](https://arxiv.org/abs/2504.06742)
 
 Copyright German Cancer Research Center (DKFZ) and contributors. Please make sure that your usage of this code is in compliance with its license.
 
