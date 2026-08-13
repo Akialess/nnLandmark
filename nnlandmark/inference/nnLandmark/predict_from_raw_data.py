@@ -480,6 +480,7 @@ class nnUNetPredictor(object):
         main_thread_wait_for_preprocessing_times = []
         main_thread_wait_for_export_pool_times = []
         preprocess_subtimes_per_case = {}  # data_id -> dict of sub-timings
+        memory_per_case = {}  # data_id -> {'peak_gpu_mb': ..., 'ram_mb': ...}
         startup_overhead = 0.0
 
         pool_creation_start = time.time()
@@ -548,22 +549,42 @@ class nnUNetPredictor(object):
                 print(f'main_thread_wait_for_export_pool_seconds for {data_id}: {export_pool_wait_elapsed:.4f}s')
 
                 # Compute inference time
+                profile_mem = getattr(self, 'profile_memory', False)
                 if self.device.type == 'cuda' :
-                    torch.cuda.synchronize()  
+                    if profile_mem:
+                        torch.cuda.reset_peak_memory_stats(self.device)
+                    torch.cuda.synchronize()
                 else :
                     None
                 start_time = time.time()
 
                 # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
                 prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
-                
+
                 if self.device.type == 'cuda' :
-                    torch.cuda.synchronize()  
-                else : 
+                    torch.cuda.synchronize()
+                else :
                     None
                 elapsed = time.time() - start_time
                 main_thread_inference_times.append((data_id, elapsed))
                 print(f'main_thread_inference_time_seconds for {data_id}: {elapsed:.4f}s')
+
+                if profile_mem:
+                    gpu_peak_mb = 0.0
+                    if self.device.type == 'cuda':
+                        gpu_peak_mb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
+                    try:
+                        with open('/proc/self/status', 'r') as _f:
+                            for _line in _f:
+                                if _line.startswith('VmRSS:'):
+                                    ram_mb = int(_line.split()[1]) / 1024.0
+                                    break
+                    except (OSError, ValueError):
+                        import resource
+                        ram_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+                    memory_per_case[data_id] = {'peak_gpu_mb': gpu_peak_mb, 'ram_mb': ram_mb}
+                    print(f'peak_gpu_memory_mb for {data_id}: {gpu_peak_mb:.1f}')
+                    print(f'ram_rss_mb for {data_id}: {ram_mb:.1f}')
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
@@ -736,7 +757,9 @@ class nnUNetPredictor(object):
                 if not seq_file_exists:
                     writer.writerow(seq_header)
 
-                for data_id, t_dict in times_dict.items():
+                seq_data_ids = list(times_dict.keys())
+                for seq_idx, (data_id, t_dict) in enumerate(times_dict.items()):
+                    seq_is_last = (seq_idx == len(seq_data_ids) - 1)
                     wrapper_time = getattr(self, 'wrapper_loading_time', 0.0)
                     model_time = getattr(self, 'model_loading_time', 0.0)
                     weights_time = getattr(self, 'weights_loading_time', 0.0)
@@ -785,14 +808,27 @@ class nnUNetPredictor(object):
                         spine_v = float(t_dict.get('spine_postprocessing_time_seconds', 0.0))
                         row.append(spine_v)
                         per_case_total += spine_v
-                    
+
                     row.extend([
                         per_case_unaccounted_pre,
                         per_case_unaccounted_post,
-                        per_case_total
+                        per_case_total,
                     ])
                     writer.writerow(row)
             print(f'Sequential times saved to {seq_csv_path}')
+
+            # ---- 3. memory_usage.csv (only when --profile_memory is enabled) ----
+            if memory_per_case:
+                mem_csv_path = os.path.join(csv_dir, 'memory_usage.csv')
+                mem_file_exists = os.path.isfile(mem_csv_path)
+                with open(mem_csv_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    if not mem_file_exists:
+                        writer.writerow(['data_id', 'peak_gpu_memory_mb', 'ram_rss_mb'])
+                    for data_id in times_dict:
+                        mem = memory_per_case.get(data_id, {})
+                        writer.writerow([data_id, mem.get('peak_gpu_mb', ''), mem.get('ram_mb', '')])
+                print(f'Memory usage saved to {mem_csv_path}')
 
         # clear lru cache
         compute_gaussian.cache_clear()
@@ -1216,9 +1252,11 @@ def predict_entry_point_modelfolder():
                         help='Use fast inference pipeline: inline preprocessing with GPU resampling, '
                              'batched sliding window, no multiprocessing overhead. '
                              'Best for single-image or few-image prediction.')
-    parser.add_argument('-fast_batch_size', type=int, required=False, default=2,
+    parser.add_argument('-fast_batch_size', type=int, required=False, default=1,
                         help='Number of patches per GPU forward pass when using --fast. '
-                             'Increase if GPU memory allows for faster inference. Default: 2')
+                             'Increase if GPU memory allows for faster inference. Default: 1')
+    parser.add_argument('--profile_memory', action='store_true', default=False,
+                        help='Track peak GPU and RAM memory per image and save to memory_usage.csv.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -1256,7 +1294,9 @@ def predict_entry_point_modelfolder():
                                 verbose=args.verbose,
                                 allow_tqdm=not args.disable_progress_bar,
                                 verbose_preprocessing=args.verbose,
-                                spine_process=args.spine_process)
+                                spine_process=args.spine_process,
+                                )
+    predictor.profile_memory = args.profile_memory
     predictor.script_start_time = script_start_time
     predictor.initialize_from_trained_model_folder(args.m, args.f, args.chk)
 
@@ -1363,9 +1403,11 @@ def predict_entry_point():
                         help='Use fast inference pipeline: inline preprocessing with GPU resampling, '
                              'batched sliding window, no multiprocessing overhead. '
                              'Best for single-image or few-image prediction.')
-    parser.add_argument('-fast_batch_size', type=int, required=False, default=2,
+    parser.add_argument('-fast_batch_size', type=int, required=False, default=1,
                         help='Number of patches per GPU forward pass when using --fast. '
-                             'Increase if GPU memory allows for faster inference. Default: 2')
+                             'Increase if GPU memory allows for faster inference. Default: 1')
+    parser.add_argument('--profile_memory', action='store_true', default=False,
+                        help='Track peak GPU and RAM memory per image and save to memory_usage.csv.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -1373,7 +1415,7 @@ def predict_entry_point():
         "Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). "
         "nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. "
         "Nature methods, 18(2), 203-211.\n#######################################################################\n")
-    
+
     print(
         "\n#######################################################################\nPlease cite the following paper when using nnLandmark:\n"
         "Ertl, A., Denner, S., Peretzke, R., Xiao, S., Zimmerer, D., Fischer, M., Bujotzek, M., Yang, X., Neher, P., Isensee, F., & Maier-Hein, K. H. (2026). "
@@ -1414,7 +1456,9 @@ def predict_entry_point():
                                 verbose=args.verbose,
                                 verbose_preprocessing=args.verbose,
                                 allow_tqdm=not args.disable_progress_bar,
-                                spine_process=args.spine_process)
+                                spine_process=args.spine_process,
+                                )
+    predictor.profile_memory = args.profile_memory
     predictor.script_start_time = script_start_time
     predictor.initialize_from_trained_model_folder(
         model_folder,

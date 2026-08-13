@@ -4,15 +4,14 @@ import numpy as np
 import torch
 from acvl_utils.cropping_and_padding.bounding_boxes import insert_crop_into_image
 from batchgenerators.utilities.file_and_folder_operations import load_json, save_pickle, join
+from scipy import ndimage
+import time
 
 from nnlandmark.paths import nnLM_raw
 from nnlandmark.configuration import default_num_processes
 from nnlandmark.training.dataloading.nnunet_dataset import nnUNetDatasetBlosc2
 from nnlandmark.utilities.label_handling.label_handling import LabelManager
 from nnlandmark.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
-
-
-import time
 
 @torch.inference_mode()
 def convert_probabilities_to_segmentation(predicted_probabilities: torch.Tensor) -> torch.Tensor:
@@ -104,54 +103,85 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
 #    returns (coord_tuple_or_None, likelihood)
 #    coords are (x, y, z); likelihood is float in [0,1].
 # ──────────────────────────────────────────────────────────────────────────────
-def _extract_landmark_coord_and_likelihood(probs_zyx: np.ndarray,
+
+# Original extract landmark coord
+
+def _extract_landmark_coord_and_likelihood_old(probs_zyx: np.ndarray,
                                            top_percent: float = 0.5):
     """
     probs_zyx: (Z, Y, X) ndarray with probabilities in [0,1].
-    Returns ( (x, y, z), likelihood_float ) or (None, 0.0) if empty.
+    - Drop exact 1.0 plateaus (set to 0) to avoid degenerate flats.
+    - Optionally restrict to the top `top_percent`% positive voxels.
+    Returns:
+      ( (x, y, z), likelihood_float ) or (None, 0.0) if empty.
     """
     a = np.asarray(probs_zyx, dtype=np.float32, order='C').copy()
-
-    # Mask to top k% of positive voxels (by value)
-    vals = a[a > 0]
-    n = vals.size
-    k = max(1, int(np.ceil(n * (top_percent / 100.0))))
-
-    if k < n:
-        thr = np.partition(vals, n - k)[n - k]
-        a[a < thr] = 0.0          # zero out everything below threshold in-place
-    else:
-        pass                       # keep all positive voxels
+    a[a == 1.0] = 0.0  # drop perfect plateaus as in your current logic
 
     if not np.any(a > 0):
         return None, 0.0
 
-    # --- Center of mass (weighted average of coordinates) ---
-    total = a.sum()
+    # Mask to top k% of positive voxels (by value), default 0.5%
+    vals = a[a > 0]
+    n = vals.size
+    k = max(1, int(np.ceil(n * (top_percent / 100.0))))
+    if k < n:
+        thr = np.partition(vals, n - k)[n - k]
+        mask = a >= thr
+    else:
+        mask = a > 0
 
-    # Build coordinate grids only along each axis, then broadcast via dot-like ops
-    # This avoids materializing full (Z,Y,X)-shaped index arrays.
-    z_coords = np.arange(a.shape[0], dtype=np.float32)
-    y_coords = np.arange(a.shape[1], dtype=np.float32)
-    x_coords = np.arange(a.shape[2], dtype=np.float32)
+    if not np.any(mask):
+        # Fall back to simple global argmax
+        z, y, x = np.unravel_index(int(np.argmax(a)), a.shape)
+        return (int(x), int(y), int(z)), float(a[z, y, x])
 
-    # sum over Y,X → shape (Z,), then dot with z_coords
-    z_com = z_coords.dot(a.sum(axis=(1, 2))) / total
-    # sum over Z,X → shape (Y,)
-    y_com = y_coords.dot(a.sum(axis=(0, 2))) / total
-    # sum over Z,Y → shape (X,)
-    x_com = x_coords.dot(a.sum(axis=(0, 1))) / total
+    # Argmax within mask
+    masked = np.where(mask, a, 0.0)
+    z, y, x = np.unravel_index(int(np.argmax(masked)), masked.shape)
+    return (int(x), int(y), int(z)), float(a[z, y, x])
 
-    # Likelihood: value at the nearest voxel to the centroid
-    zi, yi, xi = (
-        int(np.clip(np.round(z_com), 0, a.shape[0] - 1)),
-        int(np.clip(np.round(y_com), 0, a.shape[1] - 1)),
-        int(np.clip(np.round(x_com), 0, a.shape[2] - 1)),
-    )
-    likelihood = float(a[zi, yi, xi])
+
+# Improved extract landmark coord
+def _extract_landmark_coord_and_likelihood(probs_zyx: np.ndarray,
+                                          peak_frac: float = 0.5,
+                                          gamma: float = 1.0):
+    """
+    probs_zyx: (Z, Y, X) heatmap in [0, 1].
+    peak_frac: keep voxels >= peak_frac * peak_value for the COM.
+    gamma:     sharpening exponent on weights (>1 pulls COM toward the peak).
+    Returns ((x, y, z), likelihood) with sub-voxel coords, or (None, 0.0).
+    """
+    a = np.ascontiguousarray(probs_zyx, dtype=np.float32)
+
+    peak_val = float(a.max())
+    if peak_val <= 0.0:
+        return None, 0.0
+
+    peak = np.unravel_index(int(np.argmax(a)), a.shape)  # (z, y, x)
+
+    # Isolate the connected component that contains the global peak,
+    # so secondary modes / spurious blobs can't drag the centroid.
+    mask = a >= peak_frac * peak_val
+    labels, _ = ndimage.label(mask)
+    blob = labels == labels[peak]
+
+    w = np.where(blob, a, 0.0).astype(np.float64)
+    if gamma != 1.0:
+        w = w ** gamma
+
+    total = w.sum()
+    z = np.arange(a.shape[0], dtype=np.float64)
+    y = np.arange(a.shape[1], dtype=np.float64)
+    x = np.arange(a.shape[2], dtype=np.float64)
+    z_com = z @ w.sum(axis=(1, 2)) / total
+    y_com = y @ w.sum(axis=(0, 2)) / total
+    x_com = x @ w.sum(axis=(0, 1)) / total
+
+    # Likelihood from the original heatmap, trilinearly interpolated.
+    likelihood = float(ndimage.map_coordinates(a, [[z_com], [y_com], [x_com]], order=1, mode="nearest")[0])
 
     return (float(x_com), float(y_com), float(z_com)), likelihood
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 #    Assumes `probabilities_final` is (C, Z, Y, X) after all reversals!
@@ -217,8 +247,8 @@ def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, tor
     t2_export = time.time()
     with open(output_file_truncated + ".json", "w") as f:
         json.dump(out_json, f, indent=4)
-    times['export_output_time_seconds'] = time.time() - t2_export + t1_export
     
+    times['export_output_time_seconds'] = time.time() - t2_export + t1_export
     return times
 
 

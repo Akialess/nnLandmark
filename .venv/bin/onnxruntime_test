@@ -1,8 +1,6 @@
-#!/auto/home/users/a/g/agiansan/nnLandmark/.venv/bin/python
-# -*- coding: utf-8 -*-
-import re
+#!/home/alessandro/Documents/Soumission/TFE/nnLandmark/.venv/bin/python3
 import sys
 from onnxruntime.tools.onnxruntime_test import main
 if __name__ == '__main__':
-    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
     sys.exit(main())

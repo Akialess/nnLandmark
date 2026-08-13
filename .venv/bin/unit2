@@ -1,0 +1,6 @@
+#!/home/alessandro/Documents/Soumission/TFE/nnLandmark/.venv/bin/python3
+import sys
+from unittest2.__main__ import main_
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main_())

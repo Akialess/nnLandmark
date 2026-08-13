@@ -1,19 +1,10 @@
-"""
-Fast single-image inference for nnLandmark.
-
-Optimizations over the default nnUNet pipeline:
-  1. Inline preprocessing — no multiprocessing spawn/queues for a single image
-  2. GPU-accelerated resampling — torch F.interpolate instead of skimage.resize (CPU)
-  3. No export pool — landmark coordinate extraction is lightweight, runs inline
-  4. Batched sliding window — multiple patches in one GPU forward pass
-  5. Removed segmentation-only code paths (cascade, one-hot, foreground sampling)
-"""
-
 import csv
 import os
 import time
 import json
 from typing import Tuple, Union, List, Optional
+
+import nnlandmark
 
 import numpy as np
 import torch
@@ -22,28 +13,21 @@ from acvl_utils.cropping_and_padding.bounding_boxes import get_bbox_from_mask, b
 from acvl_utils.cropping_and_padding.padding import pad_nd_image
 from tqdm import tqdm
 
-from nnlandmark.inference.nnLandmark.export_prediction import (
-    export_prediction_from_logits,
-    _extract_landmark_coord_and_likelihood,
-)
+from nnlandmark.inference.nnLandmark.export_prediction import _extract_landmark_coord_and_likelihood
 from nnlandmark.inference.nnLandmark.sliding_window_prediction import (
     compute_gaussian,
     compute_steps_for_sliding_window,
 )
 from nnlandmark.utilities.helpers import empty_cache, dummy_context
+from batchgenerators.utilities.file_and_folder_operations import join
+from nnlandmark.utilities.find_class_by_name import recursive_find_python_class
+from nnlandmark.preprocessing.resampling.default_resampling import compute_new_shape
+from batchgenerators.utilities.file_and_folder_operations import maybe_mkdir_p
 
-
-# ---------------------------------------------------------------------------
-# Fast preprocessing: GPU resampling, no segmentation, no multiprocessing
-# ---------------------------------------------------------------------------
 
 def _crop_to_nonzero_fast(data: np.ndarray):
     """
     Crop to non-zero bounding box without scipy binary_fill_holes.
-
-    binary_fill_holes is expensive on large 3D volumes and only matters for
-    training (mask-based normalization). For inference, a simple bounding box
-    on the non-zero region is sufficient and much faster.
     """
     nonzero_mask = np.any(data != 0, axis=0)  # collapse channel dim
     bbox = get_bbox_from_mask(nonzero_mask)
@@ -51,25 +35,21 @@ def _crop_to_nonzero_fast(data: np.ndarray):
     data = data[(slice(None),) + slicer]
     return data, bbox
 
-
 def _resample_gpu(data_tensor: torch.Tensor, new_shape: List[int],
                   device: torch.device) -> torch.Tensor:
     """
     Resample a 4D tensor (C, D, H, W) to new_shape using GPU trilinear interpolation.
-
-    F.interpolate with trilinear is orders of magnitude faster than
-    skimage.transform.resize(order=3) on CPU for large 3D medical volumes.
     """
     if list(data_tensor.shape[1:]) == list(new_shape):
         return data_tensor
-    # F.interpolate expects (N, C, D, H, W)
+
     out = F.interpolate(
         data_tensor.unsqueeze(0).float().to(device),
         size=new_shape,
         mode='trilinear',
         align_corners=False,
     )
-    return out.squeeze(0)  # back to (C, D, H, W)
+    return out.squeeze(0) # back to (C, D, H, W)
 
 
 def preprocess_fast(image_files: List[str],
@@ -81,44 +61,30 @@ def preprocess_fast(image_files: List[str],
     """
     Fast inline preprocessing for a single image. No multiprocessing.
 
-    Replaces the full DefaultPreprocessor pipeline with:
-      - Image loading (SimpleITK, unavoidable)
-      - Transpose
-      - Crop to nonzero (fast, no binary_fill_holes)
-      - Normalization (CPU, usually fast)
-      - GPU resampling (trilinear, replaces slow CPU bicubic)
-
     Returns:
       (data_tensor, properties_dict)
     """
-    import nnlandmark
-    from batchgenerators.utilities.file_and_folder_operations import join
-    from nnlandmark.utilities.find_class_by_name import recursive_find_python_class
-    from nnlandmark.preprocessing.resampling.default_resampling import compute_new_shape
 
     t0 = time.time()
 
-    # --- Load image ---
+    # Load image
     rw = plans_manager.image_reader_writer_class()
     data, properties = rw.read_images(image_files)
     t_load = time.time()
 
-    # --- Transpose ---
+    # Transpose
     data = data.astype(np.float32, copy=False)
     data = data.transpose([0, *[i + 1 for i in plans_manager.transpose_forward]])
     original_spacing = [properties['spacing'][i] for i in plans_manager.transpose_forward]
 
-    # --- Crop to nonzero (fast) ---
+    # Crop to nonzero
     properties['shape_before_cropping'] = data.shape[1:]
     data, bbox = _crop_to_nonzero_fast(data)
     properties['bbox_used_for_cropping'] = bbox
     properties['shape_after_cropping_and_before_resampling'] = data.shape[1:]
     t_crop = time.time()
 
-    # --- Normalize (must happen before resampling) ---
-    # Normalization needs a seg mask for mask-based normalization (ZScore).
-    # seg >= 0 means "foreground" to the normalizer. Mark zero-valued voxels
-    # as -1 (outside) so mask-based normalization ignores them.
+    # Normalization
     nonzero_mask = np.any(data != 0, axis=0)
     seg_dummy = np.where(nonzero_mask, np.int8(0), np.int8(-1))
     for c in range(data.shape[0]):
@@ -135,7 +101,7 @@ def preprocess_fast(image_files: List[str],
         data[c] = normalizer.run(data[c], seg_dummy)
     t_norm = time.time()
 
-    # --- GPU resampling ---
+    # GPU resampling
     target_spacing = configuration_manager.spacing
     if len(target_spacing) < len(data.shape[1:]):
         target_spacing = [original_spacing[0]] + list(target_spacing)
@@ -143,8 +109,8 @@ def preprocess_fast(image_files: List[str],
 
     data_tensor = torch.from_numpy(data)
     data_tensor = _resample_gpu(data_tensor, [int(s) for s in new_shape], device)
-    # Move back to CPU to match the rest of the pipeline expectations
-    data_tensor = data_tensor.cpu()
+    data_tensor = data_tensor.cpu() # Move back to CPU to match the rest of the pipeline expectations
+
     t_resample = time.time()
 
     preprocess_times = {
@@ -162,11 +128,6 @@ def preprocess_fast(image_files: List[str],
               f'spacing: {original_spacing} -> {list(target_spacing)}')
 
     return data_tensor, properties, preprocess_times
-
-
-# ---------------------------------------------------------------------------
-# Batched sliding window prediction
-# ---------------------------------------------------------------------------
 
 def _predict_sliding_window_batched(
     network: torch.nn.Module,
@@ -274,18 +235,13 @@ def _predict_sliding_window_batched(
     predicted_logits = predicted_logits[(slice(None), *slicer_revert[1:])]
     return predicted_logits
 
-
-# ---------------------------------------------------------------------------
-# Fast landmark extraction (no resampling of full probability volume)
-# ---------------------------------------------------------------------------
-
 def _extract_landmarks_from_logits(
     predicted_logits: torch.Tensor,
     properties: dict,
     plans_manager,
     label_manager,
     output_file_truncated: Optional[str] = None,
-    spine_process: bool = False,
+    verbose: bool = True,
 ) -> Tuple[dict, dict]:
     """
     Extract landmark coordinates directly from network-resolution logits.
@@ -295,12 +251,11 @@ def _extract_landmarks_from_logits(
     coordinates back. This is what export_prediction_from_logits already does,
     but we call it inline without multiprocessing.
 
-        When spine_process=True, uses spine centerline-based postprocessing instead
-        of per-channel argmax.
-
-        Returns:
-            (output_json, postprocess_times)
+    Returns:
+        (output_json, postprocess_times)
     """
+
+    # For measurement times
     post_times = {
         'resampling_time_seconds': 0.0,
         'mask_conversion_time_seconds': 0.0,
@@ -323,86 +278,53 @@ def _extract_landmarks_from_logits(
 
     out_json = {}
 
-    if spine_process:
-        # --- Spine postprocessing path ---
-        from nnlandmark.inference.nnLandmark.spine_processing import postprocess_nnlandmark_output
-        print("[spine_process] Running spine postprocessing on predicted heatmaps...")
-        t0_spine = time.time()
-        spine_results = postprocess_nnlandmark_output(probs)
-        post_times['spine_postprocessing_time_seconds'] = time.time() - t0_spine
+    # Extract centroid from network volume
+    centroid_coords = {}
+    for ch, cls_id in enumerate(class_ids):
+        coord_pred, lik = _extract_landmark_coord_and_likelihood(probs[ch])
+        if coord_pred is not None:
+            centroid_coords[cls_id] = (coord_pred, lik)
 
-        spine_lookup = {}
-        for r in spine_results:
-            spine_lookup[r["label"]] = (r["coordinate"], r["likelihood"])
+    t1_centroid = time.time()
 
-        for ch, cls_id in enumerate(class_ids):
-            if ch in spine_lookup:
-                coord_pred, lik = spine_lookup[ch]
-                cz_pred, cy_pred, cx_pred = coord_pred
+    # Reverse resampling
+    t0_resample = time.time()
+    coords_cropped = {}
+    for cls_id, (coord_pred, lik) in centroid_coords.items():
+        cx, cy, cz = coord_pred
+        coords_cropped[cls_id] = (
+            cz * (shape_after_crop[0] / shape_pred[0]),
+            cy * (shape_after_crop[1] / shape_pred[1]),
+            cx * (shape_after_crop[2] / shape_pred[2]),
+            lik,
+        )
+    post_times['resampling_time_seconds'] = time.time() - t0_resample
 
-                coord_crop_z = cz_pred * (shape_after_crop[0] / shape_pred[0])
-                coord_crop_y = cy_pred * (shape_after_crop[1] / shape_pred[1])
-                coord_crop_x = cx_pred * (shape_after_crop[2] / shape_pred[2])
+    t0_crop_rev = time.time()
+    # Reverse cropping and transposing
+    for ch, cls_id in enumerate(class_ids):
+        if cls_id in coords_cropped:
+            coord_crop_z, coord_crop_y, coord_crop_x, lik = coords_cropped[cls_id]
+            coord_trans = [
+                coord_crop_z + bbox[0][0],
+                coord_crop_y + bbox[1][0],
+                coord_crop_x + bbox[2][0],
+            ]
+            coord_orig = [0, 0, 0]
+            for i in range(3):
+                coord_orig[i] = coord_trans[transpose_backward[i]]
+            out_json[str(int(cls_id))] = {
+                "coordinates": [int(round(coord_orig[2])), int(round(coord_orig[1])), int(round(coord_orig[0]))],
+                "likelihood": float(lik),
+            }
+        else:
+            out_json[str(int(cls_id))] = {
+                "coordinates": [None, None, None],
+                "likelihood": 0.0,
+            }
+    post_times['cropping_reverse_time_seconds'] = time.time() - t0_crop_rev
 
-                coord_trans = [
-                    coord_crop_z + bbox[0][0],
-                    coord_crop_y + bbox[1][0],
-                    coord_crop_x + bbox[2][0],
-                ]
-
-                coord_orig = [0, 0, 0]
-                for i in range(3):
-                    coord_orig[i] = coord_trans[transpose_backward[i]]
-
-                out_json[str(int(cls_id))] = {
-                    "coordinates": [int(round(coord_orig[2])), int(round(coord_orig[1])), int(round(coord_orig[0]))],
-                    "likelihood": float(lik),
-                }
-            else:
-                out_json[str(int(cls_id))] = {
-                    "coordinates": [None, None, None],
-                    "likelihood": 0.0,
-                }
-
-        print(f"[spine_process] Detected {len(spine_results)} vertebrae via spine postprocessing.")
-    else:
-        # --- Default per-channel argmax path ---
-        for ch, cls_id in enumerate(class_ids):
-            coord_pred, lik = _extract_landmark_coord_and_likelihood(probs[ch])
-
-            if coord_pred is None:
-                out_json[str(int(cls_id))] = {
-                    "coordinates": [None, None, None],
-                    "likelihood": 0.0,
-                }
-            else:
-                cx, cy, cz = coord_pred
-
-                # Scale from network resolution back to cropped space
-                coord_crop_z = cz * (shape_after_crop[0] / shape_pred[0])
-                coord_crop_y = cy * (shape_after_crop[1] / shape_pred[1])
-                coord_crop_x = cx * (shape_after_crop[2] / shape_pred[2])
-
-                # Revert cropping
-                coord_trans = [
-                    coord_crop_z + bbox[0][0],
-                    coord_crop_y + bbox[1][0],
-                    coord_crop_x + bbox[2][0],
-                ]
-
-                # Revert transposition
-                coord_orig = [0, 0, 0]
-                for i in range(3):
-                    coord_orig[i] = coord_trans[transpose_backward[i]]
-
-                out_json[str(int(cls_id))] = {
-                    "coordinates": [int(round(coord_orig[2])), int(round(coord_orig[1])), int(round(coord_orig[0]))],
-                    "likelihood": float(lik),
-                }
-
-    centroid_time = time.time() - t0_centroid
-    centroid_time -= post_times['spine_postprocessing_time_seconds']
-    post_times['centroid_extraction_time_seconds'] = max(0.0, centroid_time)
+    post_times['centroid_extraction_time_seconds'] = t1_centroid - t0_centroid
 
     if output_file_truncated is not None:
         t0_export = time.time()
@@ -410,7 +332,8 @@ def _extract_landmarks_from_logits(
             json.dump(out_json, f, indent=4)
         post_times['export_output_time_seconds'] = time.time() - t0_export
 
-    print(f"fast postprocessing: {post_times}")
+    if verbose:
+        print(f"fast postprocessing: {post_times}")
     return out_json, post_times
 
 
@@ -424,6 +347,9 @@ def predict_fast(
     output_folder: Optional[str] = None,
     batch_size: int = 2,
     verbose: bool = False,
+    likelihood_table_path: Optional[str] = None,
+    error_threshold_mm: Optional[float] = None,
+    error_metric: str = "p90_error_mm",
 ) -> Union[dict, List[dict]]:
     """
     Fast single-image (or few-image) landmark prediction.
@@ -431,9 +357,7 @@ def predict_fast(
     Bypasses all multiprocessing overhead of the default pipeline.
     Uses GPU resampling and batched patch inference.
 
-    Writes timing data to the same ``pipeline_times.csv`` used by the default
-    pipeline (appends rows with the same columns) so you can directly compare
-    the two approaches side-by-side.
+    Writes timing data to `pipeline_times.csv`
 
     Args:
         predictor: initialized nnUNetPredictor instance
@@ -445,68 +369,85 @@ def predict_fast(
         batch_size: number of patches per GPU forward pass (default 2,
             increase if GPU memory allows for faster inference)
         verbose: print timing breakdown
+        likelihood_table_path: path to a calibration lookup table JSON
+            (built by likelihood_calibration.py). When provided together with
+            error_threshold_mm, predictions whose expected error exceeds the
+            threshold are discarded.
+        error_threshold_mm: maximum expected error (mm) to keep a prediction.
+            Requires likelihood_table_path.
+        error_metric: which error statistic to look up in the table.
+            One of "p90_error_mm", "median_error_mm", "mean_error_mm".
 
     Returns:
         dict or list of dicts with landmark coordinates per case.
     """
-    from batchgenerators.utilities.file_and_folder_operations import (
-        maybe_mkdir_p, subfiles
-    )
-
+    
     total_start = time.time()
 
-    # Normalize input to List[List[str]]
-    if isinstance(image_files, str):
-        if os.path.isdir(image_files):
-            # Folder: find all matching files
-            from nnlandmark.utilities.utils import create_lists_from_splitted_dataset_folder
-            cases = create_lists_from_splitted_dataset_folder(
-                image_files, predictor.dataset_json['file_ending']
-            )
-        else:
-            cases = [[image_files]]
+    # Normalize input to list_of_lists_or_source_folder because we also accept only one image
+
+    # Folder path
+    if isinstance(image_files, str) and os.path.isdir(image_files):
+        list_of_lists_or_source_folder = image_files
+    # Single image with one channel
+    elif isinstance(image_files, str):
+        list_of_lists_or_source_folder = [[image_files]]
+
     elif isinstance(image_files, list) and len(image_files) > 0:
+        # Single image with multiple channels
         if isinstance(image_files[0], str):
-            cases = [image_files]  # single case, multiple channels
+            list_of_lists_or_source_folder = [image_files]
         else:
-            cases = image_files  # already List[List[str]]
+            # Multiple images, each with multiple channels
+            list_of_lists_or_source_folder = image_files
     else:
         raise ValueError(f"Unsupported image_files type: {type(image_files)}")
 
     if output_folder is not None:
         maybe_mkdir_p(output_folder)
 
+    list_of_lists_or_source_folder, output_filename_truncated, _ = (
+        predictor._manage_input_and_output_lists(
+            list_of_lists_or_source_folder,
+            output_folder,
+            folder_with_segs_from_prev_stage=None,
+            overwrite=True,
+            part_id=0,
+            num_parts=1,
+            save_probabilities=False,
+        )
+    )
+
+    if len(list_of_lists_or_source_folder) == 0:
+        return []
+
     device = predictor.device
     network = predictor.network
     network.to(device)
     network.eval()
 
-    patch_size = predictor.configuration_manager.patch_size
-    num_output_channels = predictor.label_manager.num_segmentation_heads - 1
-
-    # ---- Timing accumulators (same columns as predict_from_data_iterator) ----
-    # Columns that don't apply in the fast path are recorded as 0.
     wrapper_time = getattr(predictor, 'wrapper_loading_time', 0.0)
     model_time = getattr(predictor, 'model_loading_time', 0.0)
     weights_time = getattr(predictor, 'weights_loading_time', 0.0)
-    # file_setup / data_iterator_setup / pool_creation are zero (skipped)
     file_setup_time = 0.0
     data_iterator_setup_time = 0.0
     pool_creation_time = 0.0
-
-    per_case_times = {}  # data_id -> dict of column values
-    post_subtimes_per_case = {}  # data_id -> postprocess subtimes
-
-    spine_process_enabled = getattr(predictor, 'spine_process', False)
+    per_case_times = {} 
+    post_subtimes_per_case = {} 
 
     results = []
-    for case_idx, case_files in enumerate(cases):
+    for case_index, case_files in enumerate(list_of_lists_or_source_folder):
         case_start = time.time()
-        case_id = os.path.basename(case_files[0]).split('_0000')[0].split('.')[0]
+        if output_filename_truncated is not None:
+            output_path = output_filename_truncated[case_index]
+            case_id = os.path.basename(output_path)
+        else:
+            output_path = None
+            case_id = os.path.basename(case_files[0]).split('_0000')[0].split('.')[0]
         if verbose:
             print(f'\nPredicting {case_id}:')
 
-        # --- Fast preprocessing (inline, GPU resampling) ---
+        # Fast preprocessing
         t_pre = time.time()
         data_tensor, properties, preprocess_subtimes = preprocess_fast(
             case_files,
@@ -517,52 +458,30 @@ def predict_fast(
             verbose=verbose,
         )
         preprocess_time = time.time() - t_pre
-        print(f'background_preprocessing_time_seconds for {case_id}: {preprocess_time:.4f}s')
-
-        # In fast mode preprocessing is inline, so the main thread "wait" for
-        # preprocessing equals the preprocessing time itself.
-        wait_for_preprocessing_time = preprocess_time
+        wait_for_preprocessing_time = preprocess_time # In fast mode preprocessing is inline, so the main thread wait for preprocessing equals the preprocessing time itself.
+        wait_for_export_pool_time = 0.0 # No export pool so zero wait
+        if verbose :
+            print(f'background_preprocessing_time_seconds for {case_id}: {preprocess_time:.4f}s')
         print(f'main_thread_wait_for_preprocessing_seconds for {case_id}: {wait_for_preprocessing_time:.4f}s')
-
-        # No export pool → zero wait
-        wait_for_export_pool_time = 0.0
         print(f'main_thread_wait_for_export_pool_seconds for {case_id}: {wait_for_export_pool_time:.4f}s')
 
-        # --- Network inference (batched sliding window) ---
+        # Network inference
         if device.type == 'cuda':
+            empty_cache(device)
             torch.cuda.synchronize()
+
         t_inf = time.time()
-        with torch.autocast(device.type, enabled=True) if device.type == 'cuda' else dummy_context():
-            # Handle multi-fold ensemble
-            prediction = None
-            for params in predictor.list_of_parameters:
-                from torch._dynamo import OptimizedModule
-                if not isinstance(network, OptimizedModule):
-                    network.load_state_dict(params)
-                else:
-                    network._orig_mod.load_state_dict(params)
 
-                fold_pred = _predict_sliding_window_batched(
-                    network, data_tensor, patch_size, predictor.tile_step_size,
-                    num_output_channels, device,
-                    use_gaussian=predictor.use_gaussian,
-                    batch_size=batch_size,
-                    verbose=verbose,
-                )
-                if prediction is None:
-                    prediction = fold_pred
-                else:
-                    prediction += fold_pred
-
-            if len(predictor.list_of_parameters) > 1:
-                prediction /= len(predictor.list_of_parameters)
+        prediction = predictor.predict_logits_from_preprocessed_data(data_tensor)
 
         if device.type == 'cuda':
             torch.cuda.synchronize()
-        inference_time = time.time() - t_inf
-        print(f'main_thread_inference_time_seconds for {case_id}: {inference_time:.4f}s')
 
-        # --- Extract landmarks (inline, no export pool) ---
+        inference_time = time.time() - t_inf
+        if verbose:
+            print(f'main_thread_inference_time_seconds for {case_id}: {inference_time:.4f}s')
+
+        # Extract landmarks
         t_post = time.time()
         ofile = None
         if output_folder is not None:
@@ -571,45 +490,41 @@ def predict_fast(
         landmarks, postprocess_subtimes = _extract_landmarks_from_logits(
             prediction, properties, predictor.plans_manager,
             predictor.label_manager, ofile,
-            spine_process=spine_process_enabled,
         )
         postprocess_time = time.time() - t_post
-        print(f'background_postprocessing_time_seconds for {case_id}: {postprocess_time:.4f}s')
-
-        # Inline → main thread "waits" for postprocessing = postprocessing time
         wait_for_postprocessing_time = postprocess_time
-        print(f'main_thread_wait_for_postprocessing_seconds for {case_id}: {wait_for_postprocessing_time:.4f}s')
+        if verbose:
+            print(f'background_postprocessing_time_seconds for {case_id}: {postprocess_time:.4f}s')
+            print(f'main_thread_wait_for_postprocessing_seconds for {case_id}: {wait_for_postprocessing_time:.4f}s')
 
         results.append(landmarks)
 
-        empty_cache(device)
-
-        # Store per-case timing (for the original pipeline_times.csv)
         per_case_times[case_id] = {
-            'background_preprocessing_time_seconds': preprocess_time,
             'main_thread_wait_for_preprocessing_seconds': wait_for_preprocessing_time,
+            'background_preprocessing_time_seconds': preprocess_time,
             'main_thread_wait_for_export_pool_seconds': wait_for_export_pool_time,
             'main_thread_inference_time_seconds': inference_time,
             'main_thread_wait_for_postprocessing_seconds': wait_for_postprocessing_time,
             'background_postprocessing_time_seconds': postprocess_time,
-            # Sequential sub-timings
             '_preprocess_subtimes': preprocess_subtimes,
-            'spine_postprocessing_time_seconds': postprocess_subtimes.get('spine_postprocessing_time_seconds', 0.0),
         }
         post_subtimes_per_case[case_id] = postprocess_subtimes
 
-        print(f'done with {case_id}')
+        empty_cache(device)
 
-    # ---- Compute total time ----
+        if verbose:
+            print(f'done with {case_id}')
+
+    # Compute total time
     total_time = time.time() - predictor.script_start_time \
         if hasattr(predictor, 'script_start_time') else time.time() - total_start
-    print(f"\ntotal predict time : {total_time}", flush=True)
+    if verbose:
+        print(f"\ntotal predict time : {total_time}", flush=True)
 
-    # ---- Write CSVs ----
+    # Write CSV
     if per_case_times:
         csv_dir = output_folder if output_folder is not None else os.getcwd()
 
-        # ---- 1. Original pipeline_times.csv (same format as predict_from_data_iterator) ----
         csv_path = os.path.join(csv_dir, 'pipeline_times.csv')
         file_exists = os.path.isfile(csv_path)
         with open(csv_path, 'a', newline='') as f:
@@ -630,7 +545,7 @@ def predict_fast(
                     'main_thread_wait_for_postprocessing_seconds',
                     'background_postprocessing_time_seconds',
                     'unaccounted_main_thread_time_seconds',
-                    'case_pipeline_time_seconds', 
+                    'case_pipeline_time_seconds',
                     'pipeline_total_time_seconds',
                 ])
 
@@ -674,7 +589,7 @@ def predict_fast(
                 ])
         print(f'\nPipeline times saved to {csv_path}')
 
-        # ---- 2. Sequential timing CSV (granular, no wait/pool columns) ----
+        # Sequential timing CSV
         seq_csv_path = os.path.join(csv_dir, 'sequential_times.csv')
         seq_file_exists = os.path.isfile(seq_csv_path)
         with open(seq_csv_path, 'a', newline='') as f:
@@ -698,13 +613,6 @@ def predict_fast(
                 'export_output_time_seconds',
                 'postprocessing_time_seconds',
             ]
-            if spine_process_enabled:
-                seq_header.append('spine_postprocessing_time_seconds')
-            seq_header.extend([
-                'unaccounted_pre_time_seconds',
-                'unaccounted_post_time_seconds',
-                'total_time_seconds',
-            ])
 
             if not seq_file_exists:
                 writer.writerow(seq_header)
@@ -713,7 +621,7 @@ def predict_fast(
             model_v = float(model_time) if model_time else 0.0
             weights_v = float(weights_time) if weights_time else 0.0
 
-            for data_id, t in per_case_times.items():
+            for seq_idx, (data_id, t) in enumerate(per_case_times.items()):
                 sub = t.get('_preprocess_subtimes', {})
                 load_v = sub.get('load_time_seconds', 0.0)
                 crop_v = sub.get('crop_time_seconds', 0.0)
@@ -729,15 +637,6 @@ def predict_fast(
                 crop_rev_v = post_sub.get('cropping_reverse_time_seconds', 0.0)
                 centroid_v = post_sub.get('centroid_extraction_time_seconds', 0.0)
                 export_v = post_sub.get('export_output_time_seconds', 0.0)
-
-                per_case_total = preprocess_total_v + inf_v + post_v
-                per_case_unaccounted_pre = preprocess_total_v - (load_v + crop_v + norm_v + pre_resample_v)
-
-                accounted_post = post_resample_v + mask_v + crop_rev_v + centroid_v + export_v
-                spine_v = float(t.get('spine_postprocessing_time_seconds', 0.0))
-                if spine_process_enabled:
-                    accounted_post += spine_v
-                per_case_unaccounted_post = post_v - accounted_post
 
                 row = [
                     data_id,
@@ -757,16 +656,10 @@ def predict_fast(
                     export_v,
                     post_v,
                 ]
-                if spine_process_enabled:
-                    row.append(spine_v)
-                row.extend([
-                    per_case_unaccounted_pre,
-                    per_case_unaccounted_post,
-                    per_case_total,
-                ])
 
                 writer.writerow(row)
-        print(f'Sequential times saved to {seq_csv_path}')
+        if verbose:
+            print(f'Sequential times saved to {seq_csv_path}')
 
     # Clear caches
     compute_gaussian.cache_clear()
