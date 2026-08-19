@@ -1244,19 +1244,10 @@ def predict_entry_point_modelfolder():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
-    parser.add_argument('--postprocess', action='store_true', required=False, default=False,
-                        help='Enable vertebra postprocessing for anatomically valid sequences. '
-                             'Corrects mislabelled vertebrae and fills gaps using distance priors.')
-    parser.add_argument('--spine_process', action='store_true', required=False, default=False, help='Enable experimental 3D curve-based spine postprocessing during inference.')
     parser.add_argument('--fast', action='store_true', required=False, default=False,
                         help='Use fast inference pipeline: inline preprocessing with GPU resampling, '
                              'batched sliding window, no multiprocessing overhead. '
                              'Best for single-image or few-image prediction.')
-    parser.add_argument('-fast_batch_size', type=int, required=False, default=1,
-                        help='Number of patches per GPU forward pass when using --fast. '
-                             'Increase if GPU memory allows for faster inference. Default: 1')
-    parser.add_argument('--profile_memory', action='store_true', default=False,
-                        help='Track peak GPU and RAM memory per image and save to memory_usage.csv.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -1303,13 +1294,13 @@ def predict_entry_point_modelfolder():
 
     if args.fast:
         from nnlandmark.inference.nnLandmark.fast_predict import predict_fast
-        print("Running in fast inference mode (GPU preprocessing, batched sliding window, no multiprocessing)")
+        if args.verbose:
+            print("Running in fast inference mode (GPU preprocessing, batched sliding window, no multiprocessing)")
         predict_fast(
             predictor,
             image_files=args.i,
             output_folder=args.o,
-            batch_size=args.fast_batch_size,
-            verbose=True,
+            verbose=args.verbose,
         )
     else:
         predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
@@ -1398,16 +1389,10 @@ def predict_entry_point():
     parser.add_argument('--postprocess', action='store_true', required=False, default=False,
                         help='Enable vertebra postprocessing for anatomically valid sequences. '
                              'Corrects mislabelled vertebrae and fills gaps using distance priors.')
-    parser.add_argument('--spine_process', action='store_true', required=False, default=False, help='Enable experimental 3D curve-based spine postprocessing during inference.')
     parser.add_argument('--fast', action='store_true', required=False, default=False,
                         help='Use fast inference pipeline: inline preprocessing with GPU resampling, '
                              'batched sliding window, no multiprocessing overhead. '
                              'Best for single-image or few-image prediction.')
-    parser.add_argument('-fast_batch_size', type=int, required=False, default=1,
-                        help='Number of patches per GPU forward pass when using --fast. '
-                             'Increase if GPU memory allows for faster inference. Default: 1')
-    parser.add_argument('--profile_memory', action='store_true', default=False,
-                        help='Track peak GPU and RAM memory per image and save to memory_usage.csv.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -1455,10 +1440,8 @@ def predict_entry_point():
                                 device=device,
                                 verbose=args.verbose,
                                 verbose_preprocessing=args.verbose,
-                                allow_tqdm=not args.disable_progress_bar,
-                                spine_process=args.spine_process,
+                                allow_tqdm=not args.disable_progress_bar
                                 )
-    predictor.profile_memory = args.profile_memory
     predictor.script_start_time = script_start_time
     predictor.initialize_from_trained_model_folder(
         model_folder,
@@ -1468,13 +1451,13 @@ def predict_entry_point():
 
     if args.fast:
         from nnlandmark.inference.nnLandmark.fast_predict import predict_fast
-        print("Running in fast inference mode (GPU preprocessing, batched sliding window, no multiprocessing)")
+        if args.verbose:   
+            print("Running in fast inference mode (GPU preprocessing, batched sliding window, no multiprocessing)")
         predict_fast(
             predictor,
             image_files=args.i,
             output_folder=args.o,
-            batch_size=args.fast_batch_size,
-            verbose=True,
+            verbose=args.verbose,
         )
 
     # run sequential

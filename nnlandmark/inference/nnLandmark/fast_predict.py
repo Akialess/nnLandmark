@@ -345,11 +345,7 @@ def predict_fast(
     predictor,
     image_files: Union[str, List[str], List[List[str]]],
     output_folder: Optional[str] = None,
-    batch_size: int = 2,
     verbose: bool = False,
-    likelihood_table_path: Optional[str] = None,
-    error_threshold_mm: Optional[float] = None,
-    error_metric: str = "p90_error_mm",
 ) -> Union[dict, List[dict]]:
     """
     Fast single-image (or few-image) landmark prediction.
@@ -462,8 +458,8 @@ def predict_fast(
         wait_for_export_pool_time = 0.0 # No export pool so zero wait
         if verbose :
             print(f'background_preprocessing_time_seconds for {case_id}: {preprocess_time:.4f}s')
-        print(f'main_thread_wait_for_preprocessing_seconds for {case_id}: {wait_for_preprocessing_time:.4f}s')
-        print(f'main_thread_wait_for_export_pool_seconds for {case_id}: {wait_for_export_pool_time:.4f}s')
+            print(f'main_thread_wait_for_preprocessing_seconds for {case_id}: {wait_for_preprocessing_time:.4f}s')
+            print(f'main_thread_wait_for_export_pool_seconds for {case_id}: {wait_for_export_pool_time:.4f}s')
 
         # Network inference
         if device.type == 'cuda':
@@ -587,7 +583,9 @@ def predict_fast(
                     t['background_preprocessing_time_seconds'] + t['main_thread_inference_time_seconds'] + t['background_postprocessing_time_seconds'],
                     total_time,
                 ])
-        print(f'\nPipeline times saved to {csv_path}')
+
+        if verbose:
+            print(f'\nPipeline times saved to {csv_path}')
 
         # Sequential timing CSV
         seq_csv_path = os.path.join(csv_dir, 'sequential_times.csv')
