@@ -38,17 +38,8 @@ def _run_script(script_name: str, forwarded_argv: list) -> None:
 
 
 def _resolve_model_folder(args, parser: argparse.ArgumentParser) -> str:
-    if args.model_folder is not None:
-        return args.model_folder
-    if args.c is not None:
-        candidate = _repo_root() / "model" / f"nnLandmark__{args.p}__{args.c}"
-        if candidate.is_dir():
-            return str(candidate)
-    if args.d is not None and args.c is not None:
-        from nnlandmark.utilities.file_path_utilities import get_output_folder
-        return get_output_folder(args.d, args.tr, args.p, args.c)
-    parser.error("Could not determine trained model folder. Pass -m/--model_folder, "
-                 "or provide -d and -c so it can be derived.")
+    from nnlandmark.utilities.file_path_utilities import get_output_folder
+    return get_output_folder(args.d, args.tr, args.p, args.c)
 
 
 def predict_optimized_entry() -> None:
@@ -66,17 +57,13 @@ def predict_optimized_entry() -> None:
                         help='Input NIfTI file or directory of NIfTI files.')
     parser.add_argument('-o', dest='output', type=str, required=True,
                         help='Output folder.')
-    parser.add_argument('-m', '--model_folder', dest='model_folder', type=str, default=None,
-                        help='Trained nnLandmark model folder. Defaults to '
-                             '<repo>/model/nnLandmark__<-p>__<-c> when present, '
-                             'else derived from -d/-c.')
-    parser.add_argument('-d', type=str, default=None,
-                        help='Dataset name/id (used to derive the trained model folder).')
+    parser.add_argument('-d', type=str, required=True,
+                        help='Dataset name/id (used to derive the trained model folder via $nnLM_results).')
     parser.add_argument('-p', type=str, default='nnUNetPlans',
                         help='Plans identifier. Default: nnUNetPlans')
-    parser.add_argument('-tr', type=str, default='nnUNetTrainer',
-                        help='Trainer class name. Default: nnUNetTrainer')
-    parser.add_argument('-c', type=str, default=None,
+    parser.add_argument('-tr', type=str, default='nnLandmark',
+                        help='Trainer class name. Default: nnLandmark')
+    parser.add_argument('-c', type=str, required=True,
                         help='Configuration (e.g. 3d_lowres_v11).')
     parser.add_argument('-f', dest='folds', nargs='+', type=int, default=(0,),
                         help='Folds to use. Default: (0,)')

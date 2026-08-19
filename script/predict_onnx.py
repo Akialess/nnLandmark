@@ -10,7 +10,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../nnUNet")))
 
 import nibabel as nib
-from vertebra_postprocessing import postprocess_json_file
 
 import torch
 import torch.nn as nn
@@ -98,10 +97,11 @@ class ONNXWrapper(nn.Module):
         return out_tensor.to(torch.float32) # ensure float32 to match previous behavior
 
 
-def predict(onnx_model_path, model_folder, input_path, output_path, folds, checkpoint, postprocess=False, fast=False, fast_batch_size=2, profile_memory=False):
+def predict(onnx_model_path, model_folder, input_path, output_path, folds, checkpoint, fast=False, verbose=False):
     time_start = time.time()
     import_time = time_start - _script_start
-    print(f"Python imports took {import_time:.2f}s")
+    if verbose:
+        print(f"Python imports took {import_time:.2f}s")
 
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -114,9 +114,11 @@ def predict(onnx_model_path, model_folder, input_path, output_path, folds, check
     session = ort.InferenceSession(onnx_model_path, sess_options=options, providers=providers)
     onnx_network = ONNXWrapper(session)
     wrapper_loading_time = time.time() - time_start
-    print(f"ONNX model loaded in {wrapper_loading_time:.2f}s")
+    if verbose:
+        print(f"ONNX model loaded in {wrapper_loading_time:.2f}s")
 
-    print("Initializing nnUNetPredictor")
+    if verbose:
+        print("Initializing nnUNetPredictor")
     use_cuda = torch.cuda.is_available()
     predictor = nnUNetPredictor(
         tile_step_size=0.5,
@@ -138,8 +140,6 @@ def predict(onnx_model_path, model_folder, input_path, output_path, folds, check
         skip_network=True
     )
 
-    predictor.profile_memory = profile_memory
-
     # Overwrite the pytorch network with the ONNX wrapper
     predictor.network = onnx_network
     # Don't load pytorch state dicts by using empty params
@@ -151,20 +151,21 @@ def predict(onnx_model_path, model_folder, input_path, output_path, folds, check
             os.path.join(input_path, f) for f in os.listdir(input_path) if f.endswith('.nii.gz')
         ])
         image_list = [[f] for f in image_files]
-        print(f"Found {len(image_files)} images in {input_path}")
+        if verbose:
+            print(f"Found {len(image_files)} images in {input_path}")
     else:
         image_files = [input_path]
         image_list = [[input_path]]
 
-    print("Running nnUNetPredictor")
+    if verbose:
+        print("Running nnUNetPredictor")
     if fast:
         from nnlandmark.inference.nnLandmark.fast_predict import predict_fast
         predict_fast(
             predictor=predictor,
             image_files=image_list,
             output_folder=output_path,
-            batch_size=1,
-            verbose=True
+            verbose=verbose
         )
     else:
         predictor.predict_from_files(
@@ -174,22 +175,11 @@ def predict(onnx_model_path, model_folder, input_path, output_path, folds, check
             overwrite=True
         )
 
-    if postprocess:
-        for img_path in image_files:
-            img = nib.load(img_path)
-            spacing = list(img.header.get_zooms()[:3])
-            case_id = os.path.basename(img_path).replace('_0000.nii.gz', '').replace('.nii.gz', '')
-            json_path = os.path.join(output_path, f"{case_id}.json")
-            if os.path.isfile(json_path):
-                print(f"\nRunning vertebra postprocessing on {json_path}...")
-                postprocess_json_file(json_path, spacing)
-            else:
-                print(f"\n[WARN] Postprocessing: output JSON not found at {json_path}")
-
-    print(f"\n========================================")
-    print(f"Total processing time: {time.time() - _script_start:.2f}s")
-    print(f"Output saved to: {output_path}")
-    print(f"========================================")
+    if verbose:
+        print(f"\n========================================")
+        print(f"Total processing time: {time.time() - _script_start:.2f}s")
+        print(f"Output saved to: {output_path}")
+        print(f"========================================")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Predict with ONNX model (native pipeline)')
@@ -201,9 +191,9 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default='checkpoint_final.pth', help='Checkpoint')
     parser.add_argument('--fast', action='store_true', required=False, default=False,
                         help='Use fast inference pipeline: inline preprocessing with GPU resampling, batched sliding window, no multiprocessing overhead.')
+    parser.add_argument('--verbose', action='store_true', required=False, default=False,
+                        help='Print progress and timing information.')
 
     args = parser.parse_args()
     predict(args.onnx_model, args.model_folder, args.input, args.output,
-            tuple(args.folds), args.checkpoint, postprocess=args.postprocess,
-            fast=args.fast, fast_batch_size=args.fast_batch_size,
-            profile_memory=args.profile_memory)
+            tuple(args.folds), args.checkpoint, fast=args.fast, verbose=args.verbose)

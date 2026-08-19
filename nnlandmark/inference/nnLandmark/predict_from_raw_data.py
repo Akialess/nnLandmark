@@ -194,7 +194,9 @@ class nnUNetPredictor(object):
                 parameters.append(checkpoint['network_weights'])
 
         self.weights_loading_time = time.time() - weights_loading_time
-        print(f"Model weight loading {self.weights_loading_time}s")
+
+        if self.verbose:
+            print(f"Model weight loading {self.weights_loading_time}s")
 
         model_loading_start = time.time()
 
@@ -236,7 +238,9 @@ class nnUNetPredictor(object):
         self.label_manager = plans_manager.get_label_manager(dataset_json)
 
         self.model_loading_time = time.time() - model_loading_start
-        print(f"Model loading {self.model_loading_time}s")
+
+        if self.verbose:
+            print(f"Model loading {self.model_loading_time}s")
 
     def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
                               configuration_manager: ConfigurationManager, parameters: Optional[List[dict]],
@@ -1325,6 +1329,10 @@ def predict_entry_point_modelfolder():
 def predict_entry_point():
     script_start_time = time.time()
     import argparse
+    import sys as _sys
+    if '--onnx' in _sys.argv[1:] or '--tensorrt' in _sys.argv[1:]:
+        from nnlandmark.inference.optimized_entrypoints import predict_optimized_entry
+        return predict_optimized_entry()
     parser = argparse.ArgumentParser(description='Use this to run inference with nnU-Net. This function is used when '
                                                  'you want to manually specify a folder containing a trained nnU-Net '
                                                  'model. This is useful when the nnunet environment variables '

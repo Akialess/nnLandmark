@@ -1126,10 +1126,6 @@ def predict_entry_point_modelfolder():
 
 def predict_entry_point():
     import argparse
-    import sys as _sys
-    if '--onnx' in _sys.argv[1:] or '--tensorrt' in _sys.argv[1:]:
-        from nnlandmark.inference.optimized_entrypoints import predict_optimized_entry
-        return predict_optimized_entry()
     parser = argparse.ArgumentParser(description='Use this to run inference with nnU-Net. This function is used when '
                                                  'you want to manually specify a folder containing a trained nnU-Net '
                                                  'model. This is useful when the nnunet environment variables '
