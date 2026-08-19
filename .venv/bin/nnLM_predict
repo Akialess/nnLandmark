@@ -1,6 +1,0 @@
-#!/home/alessandro/Documents/Soumission/TFE/nnLandmark/.venv/bin/python3
-import sys
-from nnlandmark.inference.nnLandmark.predict_from_raw_data import predict_entry_point
-if __name__ == '__main__':
-    sys.argv[0] = sys.argv[0].removesuffix('.exe')
-    sys.exit(predict_entry_point())
