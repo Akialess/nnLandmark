@@ -4,7 +4,13 @@ This repository is a fork of [nnLandmark](https://github.com/MIC-DKFZ/nnLandmark
 
 The full thesis is available in this repository as [`Master_thesis.pdf`](Master_thesis.pdf).
 
-The upstream nnLandmark achieves excellent identification quality but its inference pipeline, inherited from nnU-Net, is optimized for batch/research use and is too slow for interactive clinical use on a single scan. This fork keeps the training procedure of nnLandmark and rewrites the inference path around a single-image scenario. On the VerSe 2019 test set, the resulting model achieves an identification rate of **93.62%**, with an average inference time of **1.40 s per image on a server-grade GPU** (A100) and **1.58 s on a consumer-grade GPU**.
+The upstream nnLandmark achieves excellent identification quality but its inference pipeline, inherited from nnU-Net, is optimized for batch/research use and is too slow for interactive clinical use on a single scan. This fork keeps the training procedure of nnLandmark and rewrites the inference path around a single-image scenario. On the [VerSe 2019](https://osf.io/nqjyw/overview) test set, the resulting model achieves an identification rate of **93.62%**, with an average inference time of **1.40 s per image on a server-grade GPU** (A100) and **1.58 s on a consumer-grade GPU**.
+
+<p align="center">
+  <img src="images/prediction_vs_GT.png" alt="Predicted vs. ground-truth vertebra centroids on verse050 (VerSe 2019 test set)" width="80%"/>
+  <br/>
+  <em>Example of prediction on case <code>verse050</code> from the VerSe 2019 test set: predicted centroids compared with the ground truth.</em>
+</p>
 
 ## Optimizations
 
@@ -18,9 +24,46 @@ All optimizations are described in detail in Chapter 6 of the thesis. In summary
 
 4. **New postprocessing (peak-in-network-space).** The original pipeline resamples the full `C × D × H × W` logits volume back to the original image shape on CPU with trilinear interpolation, then extracts the argmax per channel. This is the slowest part of the pipeline. Instead, we apply sigmoid directly on the network-space logits, extract the argmax per channel there, and then map the resulting coordinates back to the original image space with three cheap operations: (i) scaling by the ratio between cropped and predicted shapes, (ii) adding the crop bounding-box offset, (iii) inverting the axis transposition. This eliminates the resampling step entirely and, as shown in the thesis, is at least as accurate as the original method (and slightly more precise when the input resolution is coarser than the network grid).
 
+    <p align="center">
+      <img src="images/postprocessing_new.png" alt="Steps of the new postprocessing" width="85%"/>
+      <br/>
+      <em>Steps of the new postprocessing: extract the per-channel peak in network space, then scale, offset and transpose the coordinates back to the original image space.</em>
+    </p>
+
 5. **Model conversion to ONNX and TensorRT.** The trained PyTorch model is exported to ONNX and then compiled to a TensorRT engine (FP16). ONNX Runtime applies ahead-of-time graph optimizations (operator fusion, constant folding, graph pruning); TensorRT goes further with layer/tensor fusion, kernel auto-tuning for the target GPU and half-precision inference. Both are integrated via a thin `nn.Module` wrapper that overrides `forward()`, so nnLandmark's own prediction code is untouched.
 
 6. **Minor training/inference tweaks.** Training batch size was tuned for the vertebra task, and centroids are extracted from the top-27 voxel patch of the heatmap using a **center-of-mass** rather than a plain argmax, which improves sub-voxel localization.
+
+## Results
+
+Numbers below come from Chapter 7 of the thesis, measured on the **[VerSe 2019](https://osf.io/nqjyw/overview) test set** (40 cases).
+
+**Average time per image** on an NVIDIA A100 (Tables 7.8–7.9):
+
+| Configuration | Time per image (s) |
+|---------------|--------------------|
+| Baseline      | 46.48              |
+| Optimized     | 1.72               |
+| ONNX          | 1.61               |
+| **TensorRT**  | **1.40**           |
+
+**Mean time per image across GPUs and submission modes** (Table 7.10):
+
+| Configuration | A100 multi-case | A100 single-case | RTX 3060 Ti multi-case | RTX 3060 Ti single-case |
+|---------------|-----------------|------------------|------------------------|--------------------------|
+| Optimized     | 1.58            | 7.18             | 2.01                   | 4.11                     |
+| ONNX          | 1.58            | 3.86             | 2.09                   | 2.52                     |
+| **TensorRT**  | **1.40**        | **1.88**         | **1.58**               | **1.73**                 |
+
+*Multi-case* = all images processed in a single run (setup amortized). *Single-case* = pipeline restarted for every image (setup counted each time). Identification rate is unchanged at **93.62 %** across Optimized, ONNX and TensorRT.
+
+<p align="center">
+  <img src="images/final-results.png" alt="Baseline vs. Payer C. vs. all optimizations" width="85%"/>
+  <br/>
+  <em>Comparison of the Baseline, Payer C. (top VerSe 2019 method) and our optimized configurations.</em>
+</p>
+
+Note: the Python library import time (a few seconds for PyTorch, NumPy, ONNX Runtime, TensorRT) is **not** included in these measurements. In a production deployment this cost is paid only once, at startup, if the inference process is kept alive as a persistent service.
 
 ## New scripts
 
